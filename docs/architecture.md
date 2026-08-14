@@ -1,0 +1,151 @@
+# Paperless Clerk architecture
+
+Paperless Clerk is a deliberately small sidecar. Paperless-ngx remains the
+system of record; Clerk keeps only the state required to make model work
+durable, reviewable, and safe to retry.
+
+## Reference review
+
+The reference applications demonstrate useful Paperless API conventions and a
+good manual-review workflow, but also show the costs of broad provider support,
+configuration-heavy prompt editing, exact-string taxonomy matching, in-memory
+job state, and whole-document model requests. Clerk retains the useful parts:
+token authentication, paginated vocabulary reads, tag-driven/manual processing,
+separate OCR and metadata models, per-document progress, and an explicit review
+surface. It does not inherit either application's data model or provider matrix.
+
+Paperless-ngx's current API supports the operations Clerk needs:
+
+- `GET /api/documents/{id}/` returns effective OCR content and metadata.
+- `GET /api/documents/{id}/download/` streams the archived document (or the
+  original with `?original=true`).
+- `PATCH /api/documents/{id}/` accepts `content`, canonical metadata IDs,
+  `created`, and custom-field instances shaped as `{field, value}`.
+- Tags, correspondents, document types, and custom fields are paginated API
+  resources and can be created independently.
+
+Clerk updates OCR text through the document `content` field. It does not upload
+a replacement PDF, delete originals, or attempt to reproduce Paperless storage.
+
+## Components
+
+```text
+Browser UI
+    |
+FastAPI JSON API ---- SQLite (jobs, page results, conflicts, decisions, settings)
+    |
+Durable worker pool
+    +---- Paperless client (documents and controlled vocabulary)
+    +---- PDF page renderer (PyMuPDF, temporary files)
+    +---- OCR client (OpenAI-compatible chat completions with images)
+    +---- Metadata client (OpenAI-compatible structured chat completions)
+```
+
+There is no Redis or external task service. SQLite uses WAL mode, short
+transactions, a partial unique index for active document jobs, and leases so a
+crashed worker can resume work after restart.
+
+## Job and OCR flow
+
+1. A manual request or optional poller enqueues one active job per document.
+2. A worker claims the job with a lease and fetches the current Paperless
+   document.
+3. The source file is streamed to a temporary file and hashed.
+4. Pages are rendered one at a time. At most `page_concurrency` encoded page
+   images are retained while OCR requests run. Each page is stored immediately,
+   including its attempts and error state.
+5. Page retries use bounded exponential backoff. A failed page does not cancel
+   sibling pages. A job with exhausted pages becomes an intervention rather
+   than publishing incomplete OCR.
+6. Successful page text is assembled with stable page markers.
+7. Re-fetch the Paperless document before publishing or comparing. If Paperless
+   changed during inference, recheck the source hash; a changed source retries
+   from its new pages, while a user-corrected OCR becomes the current comparison
+   input. If there is still no meaningful content, Clerk patches the assembled
+   content. Otherwise, a linear-time comparison combines token multiset overlap,
+   vocabulary overlap, ordered shingles, length agreement, and numeric-token
+   agreement.
+8. Similar OCR selects Clerk or the existing Paperless content according to the
+   configured source preference; Clerk is the default. Divergent OCR creates a
+   durable conflict containing both versions and comparison evidence, adds the
+   `ocr-conflict` tag, and stops before metadata classification.
+9. Resolving a conflict either keeps the Paperless text or replaces it with the
+   complete Clerk text, removes Clerk's conflict tag, and enqueues metadata-only
+   processing.
+
+Reclaimed jobs reuse successful page rows from the same run. Paperless writes
+occur only after all required model work and validation has succeeded.
+
+## Metadata map/reduce flow
+
+1. Fetch the complete current Paperless vocabulary before classification. If a
+   queue/watch tag is configured, remove its ID from both the document's current
+   tags and the candidate vocabulary supplied to the model; the planner also
+   rejects attempts to recreate its name.
+2. Build bounded candidate lists using normalized words, acronyms, current
+   assignments, and usage counts. This keeps large libraries inside local-model
+   context limits without trusting a model-invented existing ID.
+3. Split OCR at page/paragraph boundaries according to the configured context
+   budget. Each map call returns compact facts and candidates with source page,
+   confidence, evidence, and an explicit `existing_id` versus `new_name` choice.
+4. Send only compact map results and candidate vocabulary to a reduce call. The
+   reducer returns a single structured proposal.
+5. If an otherwise untagged document has no usable tag in that proposal, run
+   one bounded tag-only review using canonical candidates and a representative
+   cross-document text sample. When growth is enabled and that review abstains,
+   audit the abstention once with explicit form-versus-subject guidance. This
+   allows Invoice plus a broad Veterinary tag while rejecting the composite
+   Veterinary Invoice. Preserve an explicit abstention assessment when no tag
+   is justified after the audit.
+6. Serialize the short validation/write section across document workers and
+   re-fetch the vocabulary inside that lock, preventing concurrent alias
+   proposals from creating near-duplicates. Validate every existing ID against
+   the freshly fetched resource of the right type. Canonicalize every proposed
+   new name using case/punctuation folding, singularization, corporate-suffix
+   removal where appropriate, acronym matching, and token/name similarity.
+   Convert near-duplicates to existing IDs or omit them.
+7. Normalize custom-field values to the Paperless field type. New custom-field
+   definitions are rejected unless the explicit option is enabled.
+8. Re-fetch the document immediately before writing. If its OCR changed during
+   inference, retry analysis; otherwise merge against its current metadata so a
+   user's intervening tags or field corrections are not overwritten. Apply
+   according to the conservative metadata policy: tags are additive; missing
+   single-value fields are filled; replacing populated correspondent, type,
+   date, or a non-generic title requires the configured overwrite policy.
+9. In the same successful metadata patch, remove the configured queue/watch tag
+   if the document has it. Failures and OCR conflicts retain the tag, so it
+   remains a truthful marker for unfinished work.
+10. Persist the proposal, applied/withheld changes, candidate duplicates,
+   confidence, reasons, source chunks, focused tag assessment, and bounded
+   structured-output repair diagnostics without logging full document text.
+
+The governing classifier rule is `reuse -> normalize -> extend only when
+necessary`. Reuse and creation can occur in the same tag proposal.
+
+## Failure boundaries
+
+- HTTP and model retries are bounded and classify retryable status codes.
+- Whole-job retries have persisted attempt counts and due times.
+- Stale worker leases are reclaimed on startup and during polling.
+- An active-job uniqueness constraint prevents duplicate manual/poller jobs.
+- OCR conflict resolutions use an atomic claim, preventing opposing concurrent
+  choices from both modifying Paperless.
+- A pathological document occupies one worker only; other workers continue.
+- Page text and conflicts are private API details and never appear in list or
+  log payloads.
+- Container logs expose lifecycle, counts, and concise validation errors. A
+  full Decision detail can reveal bounded invalid-output previews on demand,
+  but never retains the source OCR or request prompt in that diagnostic log.
+- No Paperless OCR is overwritten on partial OCR, model parse failure, or a
+  low-confidence comparison. Preferred-source replacement occurs only after a
+  trusted comparison.
+
+## UI information architecture
+
+The build-free web client has five focused views: overview, jobs, intervention,
+decisions, and settings. The intervention queue unifies OCR conflicts and
+exhausted jobs while retaining distinct actions. Conflict detail is loaded only
+on demand and presents both texts, scores, and mismatch excerpts. Decision
+detail includes an on-demand diagnostic log containing the bounded model and
+validation trace. Manual processing is always available from the overview and
+jobs views.

@@ -1,0 +1,42 @@
+services:
+  paperless-clerk:
+    build: .
+    # image: ghcr.io/your-name/paperless-clerk:latest
+    container_name: paperless-clerk
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    # Any documented Clerk variable added to .env is passed through. The
+    # explicit entries below provide useful Compose defaults and validation.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PAPERLESS_URL: ${PAPERLESS_URL:-http://webserver:8000}
+      PAPERLESS_TOKEN: ${PAPERLESS_TOKEN:?Set PAPERLESS_TOKEN in .env}
+      PAPERLESS_VERIFY_SSL: ${PAPERLESS_VERIFY_SSL:-}
+      CLERK_OPENAI_BASE_URL: ${CLERK_OPENAI_BASE_URL:-}
+      CLERK_OPENAI_API_KEY: ${CLERK_OPENAI_API_KEY:-}
+      CLERK_OCR_MODEL: ${CLERK_OCR_MODEL:-}
+      CLERK_OCR_PROFILE: ${CLERK_OCR_PROFILE:-}
+      CLERK_PREFER_CLERK_OCR: ${CLERK_PREFER_CLERK_OCR:-}
+      CLERK_METADATA_MODEL: ${CLERK_METADATA_MODEL:-}
+      CLERK_AUTOMATION_ENABLED: ${CLERK_AUTOMATION_ENABLED:-}
+      CLERK_AUTOMATION_TAG: ${CLERK_AUTOMATION_TAG:-}
+    volumes:
+      - clerk_data:/app/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - paperless
+
+volumes:
+  clerk_data:
+
+networks:
+  paperless:
+    external: true
+    name: ${PAPERLESS_DOCKER_NETWORK:-paperless_default}

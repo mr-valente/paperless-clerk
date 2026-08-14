@@ -1,0 +1,234 @@
+import base64
+import json
+
+import httpx
+import pytest
+
+from paperless_clerk.clients.openai_compatible import ModelError, OpenAICompatibleClient
+from paperless_clerk.config import Settings
+
+
+@pytest.mark.asyncio
+async def test_ocr_and_metadata_clients_share_one_base_url() -> None:
+    settings = Settings(
+        openai_base_url="http://models.local:1234/v1/", openai_api_key="shared-secret"
+    )
+    ocr = OpenAICompatibleClient(settings, "ocr")
+    metadata = OpenAICompatibleClient(settings, "metadata")
+
+    assert ocr.completions_url == "http://models.local:1234/v1/chat/completions"
+    assert metadata.completions_url == ocr.completions_url
+    assert ocr.client.headers["authorization"] == "Bearer shared-secret"
+    assert metadata.client.headers["authorization"] == "Bearer shared-secret"
+
+    await ocr.close()
+    await metadata.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_output_falls_back_without_consuming_retry_budget() -> None:
+    formats: list[str] = []
+    schema_prompts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        schema_prompts.append("\n".join(message["content"] for message in payload["messages"]))
+        response_format = payload.get("response_format")
+        formats.append(response_format.get("type") if response_format else "none")
+        if len(formats) < 3:
+            return httpx.Response(400, text="response_format is unsupported")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+        )
+
+    client = OpenAICompatibleClient(Settings(model_max_retries=0), "metadata")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    result = await client.structured(
+        name="answer",
+        schema={"type": "object", "properties": {"answer": {"type": "string"}}},
+        system="Return JSON",
+        user="Test",
+    )
+    await client.close()
+
+    assert result == {"answer": "ok"}
+    assert formats == ["json_schema", "json_object", "none"]
+    assert all("Return exactly one JSON object matching" in prompt for prompt in schema_prompts)
+    assert all('"answer"' in prompt for prompt in schema_prompts)
+
+
+@pytest.mark.asyncio
+async def test_ocr_response_scaffolding_is_removed() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "<think>internal notes</think>\n```text\nExact page text\n```"
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenAICompatibleClient(Settings(), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    text = await client.ocr_page(b"fake image", page_number=1, prompt="Transcribe")
+    await client.close()
+
+    assert text == "Exact page text"
+    assert [message["role"] for message in requests[0]["messages"]] == ["system", "user"]
+    assert requests[0]["messages"][1]["content"][0]["text"] == "Page 1. Transcribe"
+    assert "top_k" not in requests[0]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ocr_profile_sends_one_clean_image_first_user_turn() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Exact specialist OCR text"}}]},
+        )
+
+    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    text = await client.ocr_page(b"fake image", page_number=9, prompt="generic prompt")
+    await client.close()
+
+    assert text == "Exact specialist OCR text"
+    payload = requests[0]
+    assert payload["temperature"] == 0
+    assert payload["top_k"] == 1
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "user"
+    content = payload["messages"][0]["content"]
+    assert content[0]["type"] == "image_url"
+    assert content[1] == {"type": "text", "text": "Free OCR."}
+    assert "Page 9" not in json.dumps(payload)
+    assert "generic prompt" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_deepseek_profile_removes_grounding_coordinates_but_keeps_text() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "<|grounding|><|ref|>Invoice<|/ref|>"
+                                "<|det|>[[10, 20, 30, 40]]<|/det|>\nTotal: $25.00"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    text = await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+    await client.close()
+
+    assert text == "Invoice\nTotal: $25.00"
+
+
+@pytest.mark.asyncio
+async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "CLERK OCR TEST"}}]},
+        )
+
+    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    result = await client.test_connection()
+    await client.close()
+
+    image_url = requests[0]["messages"][0]["content"][0]["image_url"]["url"]
+    image = base64.b64decode(image_url.split(",", 1)[1])
+    assert image.startswith(b"\xff\xd8")
+    assert len(image) > 1_000
+    assert result == {
+        "ok": True,
+        "model": "qwen2.5vl:7b",
+        "profile": "deepseek_ocr",
+        "response": "CLERK OCR TEST",
+    }
+
+
+@pytest.mark.asyncio
+async def test_truncated_ocr_page_is_rejected() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "A partial page that must not be published"},
+                    }
+                ]
+            },
+        )
+
+    client = OpenAICompatibleClient(Settings(), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ModelError, match="token limit"):
+        await client.ocr_page(b"fake image", page_number=7, prompt="Transcribe")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_choices_are_reported_as_a_model_error() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": []})
+
+    client = OpenAICompatibleClient(Settings(model_max_retries=0), "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ModelError, match=r"choices\[0\]"):
+        await client.ocr_page(b"fake image", page_number=1, prompt="Transcribe")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_non_object_response_is_rejected_cleanly() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = OpenAICompatibleClient(Settings(model_max_retries=0), "metadata")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ModelError, match="invalid response JSON"):
+        await client.test_connection()
+    await client.close()

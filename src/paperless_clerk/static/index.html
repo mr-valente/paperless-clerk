@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#153f3b" />
+    <meta name="description" content="Paperless Clerk — dependable local-AI document intelligence" />
+    <title>Paperless Clerk</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <script>
+      try {
+        const saved = JSON.parse(localStorage.getItem("paperless-clerk-appearance") || "null");
+        if (saved?.theme) document.documentElement.dataset.theme = saved.theme;
+        if (saved?.density) document.documentElement.dataset.density = saved.density;
+        if (saved?.motion) document.documentElement.dataset.motion = saved.motion;
+      } catch { /* use server defaults */ }
+    </script>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <a class="brand" href="#overview" aria-label="Paperless Clerk home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 40 40" role="img">
+              <path d="M10 5.5h15l6 6V34.5H10z" />
+              <path d="M25 5.5v7h6M15 19h11M15 24h11M15 29h7" />
+              <path class="spark" d="m8 11 1.2 2.8L12 15l-2.8 1.2L8 19l-1.2-2.8L4 15l2.8-1.2z" />
+            </svg>
+          </span>
+          <span><strong>Paperless</strong><em>Clerk</em></span>
+        </a>
+
+        <nav class="nav-list">
+          <a href="#overview" data-route="overview"><span class="nav-icon">⌂</span><span>Overview</span></a>
+          <a href="#jobs" data-route="jobs"><span class="nav-icon">↻</span><span>Processing</span><b id="nav-active-count"></b></a>
+          <a href="#review" data-route="review"><span class="nav-icon">◇</span><span>Intervention</span><b id="nav-review-count"></b></a>
+          <a href="#decisions" data-route="decisions"><span class="nav-icon">✓</span><span>Decisions</span></a>
+          <a href="#settings" data-route="settings"><span class="nav-icon">⚙</span><span>Settings</span></a>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="local-badge"><i></i><span>Local inference</span></div>
+          <p>Private by design.<br />Paperless stays in charge.</p>
+          <span class="version" id="app-version">Paperless Clerk</span>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <button class="mobile-menu" id="mobile-menu" aria-label="Open navigation">☰</button>
+          <div>
+            <p class="eyebrow" id="page-eyebrow">Your document desk</p>
+            <h1 id="page-title">Overview</h1>
+          </div>
+          <div class="top-actions">
+            <span class="automation-pill" id="automation-pill"><i></i><span>Automation off</span></span>
+            <button class="button primary" data-action="open-process"><span>＋</span> Process documents</button>
+          </div>
+        </header>
+
+        <main id="content" tabindex="-1">
+          <div class="initial-loader">
+            <span class="loader-mark"></span>
+            <p>Opening the clerk’s desk…</p>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div class="scrim" id="scrim"></div>
+    <aside class="drawer" id="drawer" aria-label="Details" aria-hidden="true">
+      <div id="drawer-content"></div>
+    </aside>
+
+    <dialog id="process-dialog" class="dialog">
+      <form method="dialog" id="process-form">
+        <button class="icon-button dialog-close" type="button" data-action="close-process" aria-label="Close">×</button>
+        <p class="eyebrow">Manual processing</p>
+        <h2>Send documents to Clerk</h2>
+        <p class="muted">Enter one or more Paperless document IDs. Active jobs are automatically deduplicated.</p>
+        <label class="field">
+          <span>Document IDs</span>
+          <textarea name="document_ids" rows="4" placeholder="1842, 1843, 1901" required></textarea>
+          <small>Separate IDs with commas, spaces, or new lines.</small>
+        </label>
+        <div class="field">
+          <span>Processing scope</span>
+          <div class="segmented">
+            <label><input type="radio" name="mode" value="full" checked /><span>OCR + metadata</span></label>
+            <label><input type="radio" name="mode" value="ocr" /><span>OCR only</span></label>
+            <label><input type="radio" name="mode" value="metadata" /><span>Metadata only</span></label>
+          </div>
+        </div>
+        <div class="dialog-actions">
+          <button class="button ghost" type="button" data-action="close-process">Cancel</button>
+          <button class="button primary" value="default" type="submit">Queue documents</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toasts" aria-live="polite"></div>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
