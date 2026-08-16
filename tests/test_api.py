@@ -45,9 +45,9 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert "Paperless Clerk" in page.text
     assert script.status_code == 200
     assert "renderOverview" in script.text
-    assert "DeepSeek OCR vLLM (guarded, review-only)" in script.text
+    assert "DeepSeek OCR-2 via vLLM" in script.text
     assert "DeepSeek OCR / OCR 2 profile" not in script.text
-    assert "GLM-OCR profile" not in script.text
+    assert "GLM-OCR via vLLM" in script.text
     assert "Prefer Clerk OCR after a trusted match" in script.text
     assert "OCR review versions" in script.text
     assert "Paperless had no OCR baseline" in script.text

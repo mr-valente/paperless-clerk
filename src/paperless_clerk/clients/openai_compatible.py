@@ -9,21 +9,10 @@ from typing import Any
 import httpx
 
 from paperless_clerk.config import Settings
-from paperless_clerk.prompts import DEEPSEEK_FREE_OCR_PAGE_PROMPT, DEEPSEEK_OCR_PAGE_PROMPT
+from paperless_clerk.prompts import SPECIALIST_OCR_PROFILES, ocr_prompt_for_profile
 from paperless_clerk.rendering import render_ocr_test_image
 
-OCR_REQUEST_CONTRACT_VERSION = 5
-
-# DeepSeek-OCR-2 does not terminate reliably under greedy decoding alone.  This
-# is the model author's single-image setting (the PDF runner uses the same
-# 20-token guard with a shorter search window).  It is deliberately kept as
-# named request metadata because vLLM's server-loaded adapter is a no-op unless
-# the per-request values arrive in vllm_xargs.
-DEEPSEEK_VLLM_XARGS = {
-    "ngram_size": 20,
-    "window_size": 90,
-    "whitelist_token_ids": [128821, 128822],
-}
+OCR_REQUEST_CONTRACT_VERSION = 6
 
 
 class ModelError(RuntimeError):
@@ -154,21 +143,16 @@ class OpenAICompatibleClient:
             "type": "image_url",
             "image_url": {"url": f"data:{image_media_type};base64,{encoded}"},
         }
-        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
-            # DeepSeek documents this grounded Markdown task for full pages;
-            # its Free OCR task is the layout-free mode used by the historical
-            # llama.cpp/GGUF profile.
-            specialist_prompt = (
-                DEEPSEEK_OCR_PAGE_PROMPT
-                if self.ocr_profile == "deepseek_ocr"
-                else DEEPSEEK_FREE_OCR_PAGE_PROMPT
-            )
+        if self.ocr_profile in SPECIALIST_OCR_PROFILES:
             messages = [
                 {
                     "role": "user",
                     "content": [
                         image_content,
-                        {"type": "text", "text": specialist_prompt},
+                        {
+                            "type": "text",
+                            "text": ocr_prompt_for_profile(self.ocr_profile),
+                        },
                     ],
                 }
             ]
@@ -194,29 +178,15 @@ class OpenAICompatibleClient:
             "max_tokens": self.max_output_tokens,
             "messages": messages,
         }
-        if self.ocr_profile == "deepseek_ocr":
-            # DeepSeek's published vLLM paths require its custom n-gram logits
-            # processor. Without these per-request arguments, the loaded
-            # adapter does nothing and even small pages can generate forever.
-            # This processor can change a legitimate repeated span, so the
-            # processing layer treats this profile as guarded/review-only
-            # rather than silently making it canonical Paperless OCR.
-            payload["skip_special_tokens"] = False
-            payload["vllm_xargs"] = dict(DEEPSEEK_VLLM_XARGS)
-        elif self.ocr_profile == "deepseek_ocr_llamacpp":
-            # This reproduces the earlier known-good llama.cpp/GGUF request.
-            # top_k=1 makes decoding deterministic without imposing a
-            # content-changing repetition penalty or no-repeat rule.
+        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
+            # Both DeepSeek serving stacks use the small request contract that
+            # predates the vLLM-specific tuning: one image, Free OCR, greedy
+            # decoding. This keeps the request constant when comparing native
+            # and GGUF inference.
             payload["top_k"] = 1
         body = await self._post(payload)
         finish_reason = self._finish_reason(body)
         if finish_reason in {"length", "max_tokens"}:
-            if self.ocr_profile == "deepseek_ocr":
-                raise ModelError(
-                    f"DeepSeek OCR output for page {page_number} reached the token limit "
-                    "despite its required vLLM loop guard; runaway partial output was "
-                    "discarded. Increasing the token limit would only prolong this failure."
-                )
             raise ModelError(
                 f"OCR output for page {page_number} reached the configured token limit"
             )
@@ -315,9 +285,8 @@ class OpenAICompatibleClient:
 
     async def test_connection(self) -> dict[str, Any]:
         if self.purpose == "ocr":
-            image_format = "png" if self.ocr_profile == "deepseek_ocr" else "jpeg"
             text = await self.ocr_page(
-                render_ocr_test_image(image_format),
+                render_ocr_test_image(),
                 page_number=1,
                 prompt="Transcribe the clearly printed test text.",
             )
@@ -336,18 +305,12 @@ class OpenAICompatibleClient:
                     f"{', '.join(missing_regions)}. Check the selected profile and matching "
                     "multimodal projector."
                 )
-            result = {
+            return {
                 "ok": True,
                 "model": self.model,
                 "profile": self.ocr_profile,
                 "response": text[:80],
             }
-            if self.ocr_profile == "deepseek_ocr":
-                result["message"] = (
-                    "OCR responded using DeepSeek's required loop guard. This profile is "
-                    "review-only and will not replace Paperless OCR automatically."
-                )
-            return result
         body = await self._post(
             {
                 "model": self.model,

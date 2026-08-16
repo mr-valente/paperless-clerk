@@ -24,7 +24,7 @@ class Settings(BaseModel):
     openai_base_url: str = "http://host.docker.internal:11434/v1"
     openai_api_key: SecretStr = SecretStr("")
     ocr_model: str = "qwen2.5vl:7b"
-    ocr_profile: Literal["generic", "deepseek_ocr", "deepseek_ocr_llamacpp"] = "generic"
+    ocr_profile: Literal["generic", "deepseek_ocr", "deepseek_ocr_llamacpp", "glm_ocr"] = "generic"
     prefer_clerk_ocr: bool = True
     ocr_context_tokens: int = Field(default=8192, ge=1024, le=1_000_000)
     ocr_max_output_tokens: int = Field(default=4096, ge=256, le=131_072)
@@ -99,14 +99,6 @@ class Settings(BaseModel):
                 "ntfy topic may contain only letters, numbers, dashes, and underscores"
             )
         return value
-
-    @field_validator("ocr_profile", mode="before")
-    @classmethod
-    def migrate_removed_glm_profile(cls, value: Any) -> Any:
-        # GLM-OCR support was briefly available before 0.1. Treat the removed
-        # saved/environment value as generic so an existing installation still
-        # starts safely.
-        return "generic" if value == "glm_ocr" else value
 
     @model_validator(mode="after")
     def keep_chunks_inside_context(self) -> Settings:

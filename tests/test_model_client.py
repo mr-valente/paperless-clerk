@@ -113,34 +113,25 @@ async def test_deepseek_ocr_vllm_profile_sends_native_request_contract() -> None
     await client.client.aclose()
     client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    text = await client.ocr_page(
-        b"\x89PNG\r\n\x1a\nfake image", page_number=9, prompt="generic prompt"
-    )
+    text = await client.ocr_page(b"jpeg image", page_number=9, prompt="generic prompt")
     await client.close()
 
     assert text == "Exact specialist OCR text"
     payload = requests[0]
     assert payload["temperature"] == 0
-    assert "top_k" not in payload
+    assert payload["top_k"] == 1
     # vLLM owns the DeepSeek-OCR fallback template. Sending one in the request
     # would require the unsafe-by-default --trust-request-chat-template flag.
     assert "chat_template" not in payload
-    assert payload["skip_special_tokens"] is False
-    assert payload["vllm_xargs"] == {
-        "ngram_size": 20,
-        "window_size": 90,
-        "whitelist_token_ids": [128821, 128822],
-    }
+    assert "skip_special_tokens" not in payload
+    assert "vllm_xargs" not in payload
     assert "repetition_detection" not in payload
     assert len(payload["messages"]) == 1
     assert payload["messages"][0]["role"] == "user"
     content = payload["messages"][0]["content"]
     assert content[0]["type"] == "image_url"
-    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert content[1] == {
-        "type": "text",
-        "text": "<|grounding|>Convert the document to markdown.",
-    }
+    assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert content[1] == {"type": "text", "text": "Free OCR."}
     assert "Page 9" not in json.dumps(payload)
     assert "generic prompt" not in json.dumps(payload)
 
@@ -179,6 +170,50 @@ async def test_deepseek_ocr_llamacpp_profile_reproduces_the_earlier_gguf_contrac
     content = payload["messages"][0]["content"]
     assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert content[1] == {"type": "text", "text": "Free OCR."}
+
+
+@pytest.mark.asyncio
+async def test_glm_ocr_profile_sends_native_vllm_request_contract() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Exact GLM OCR text"}}]},
+        )
+
+    client = OpenAICompatibleClient(
+        Settings(
+            ocr_profile="glm_ocr",
+            ocr_model="user.GLM-OCR-vLLM",
+            ocr_max_output_tokens=2345,
+        ),
+        "ocr",
+    )
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    text = await client.ocr_page(b"jpeg image", page_number=4, prompt="generic prompt")
+    await client.close()
+
+    assert text == "Exact GLM OCR text"
+    payload = requests[0]
+    assert payload["model"] == "user.GLM-OCR-vLLM"
+    assert payload["max_tokens"] == 2345
+    assert payload["temperature"] == 0
+    assert "top_k" not in payload
+    assert "chat_template" not in payload
+    assert "skip_special_tokens" not in payload
+    assert "vllm_xargs" not in payload
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "user"
+    content = payload["messages"][0]["content"]
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert content[1] == {"type": "text", "text": "Text Recognition:"}
+    assert "Page 4" not in json.dumps(payload)
+    assert "generic prompt" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -277,8 +312,7 @@ async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
                     {
                         "message": {
                             "content": (
-                                "PAPERLESS CLERK\nReference number: 4827\n"
-                                "END OF CLERK OCR TEST"
+                                "PAPERLESS CLERK\nReference number: 4827\nEND OF CLERK OCR TEST"
                             )
                         }
                     }
@@ -295,17 +329,13 @@ async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
 
     image_url = requests[0]["messages"][0]["content"][0]["image_url"]["url"]
     image = base64.b64decode(image_url.split(",", 1)[1])
-    assert image.startswith(b"\x89PNG\r\n\x1a\n")
+    assert image.startswith(b"\xff\xd8")
     assert len(image) > 1_000
     assert result == {
         "ok": True,
         "model": "qwen2.5vl:7b",
         "profile": "deepseek_ocr",
         "response": "PAPERLESS CLERK\nReference number: 4827\nEND OF CLERK OCR TEST",
-        "message": (
-            "OCR responded using DeepSeek's required loop guard. This profile is "
-            "review-only and will not replace Paperless OCR automatically."
-        ),
     }
 
 
@@ -314,15 +344,7 @@ async def test_ocr_connection_test_rejects_a_missing_footer_region() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": "PAPERLESS CLERK\nReference number: 4827"
-                        }
-                    }
-                ]
-            },
+            json={"choices": [{"message": {"content": "PAPERLESS CLERK\nReference number: 4827"}}]},
         )
 
     client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
@@ -359,7 +381,7 @@ async def test_truncated_ocr_page_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deepseek_token_limit_reports_failed_guard_without_recommending_more_tokens() -> None:
+async def test_deepseek_token_limited_output_is_rejected() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -377,11 +399,9 @@ async def test_deepseek_token_limit_reports_failed_guard_without_recommending_mo
     await client.client.aclose()
     client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    with pytest.raises(ModelError, match="despite its required vLLM loop guard") as raised:
+    with pytest.raises(ModelError, match="configured token limit"):
         await client.ocr_page(b"fake image", page_number=1, prompt="unused")
     await client.close()
-
-    assert "Increasing the token limit would only prolong this failure" in str(raised.value)
 
 
 @pytest.mark.asyncio

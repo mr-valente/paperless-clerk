@@ -405,14 +405,13 @@ async def test_trusted_ocr_match_uses_configured_source_preference(
 
 
 @pytest.mark.asyncio
-async def test_guarded_deepseek_match_retains_existing_paperless_ocr(
+async def test_deepseek_match_can_publish_preferred_clerk_ocr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
     job, _ = db.enqueue_job(92, "ocr", 3)
     paperless = OCRPreferencePaperless()
-    original = paperless.document["content"]
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
     outcome, text, _, updated, _ = await DocumentProcessor(
@@ -424,21 +423,24 @@ async def test_guarded_deepseek_match_retains_existing_paperless_ocr(
         NearMatchingOCRModel(),  # type: ignore[arg-type]
     )
 
+    generated = (
+        "--- Page 1 ---\n"
+        "Acme issued this detailed monthly statement with account totals and payment history\n"
+    )
     assert outcome and outcome.status == "completed"
-    assert text == original
-    assert updated["content"] == original
-    assert paperless.patches == []
+    assert text == generated
+    assert updated["content"] == generated
+    assert paperless.patches == [{"content": generated}]
     events = db.get_job(job["id"], include_events=True)["events"]
     comparison = next(event for event in events if event["event_type"] == "ocr_compared")
-    assert comparison["data"]["selected_source"] == "paperless"
-    assert "ocr_guarded_retained_paperless" in {
-        event["event_type"] for event in events
-    }
+    assert comparison["data"]["selected_source"] == "clerk"
+    assert "ocr_preference_applied" in {event["event_type"] for event in events}
 
 
 @pytest.mark.asyncio
-async def test_guarded_deepseek_without_baseline_requires_review(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("profile", ["deepseek_ocr", "glm_ocr"])
+async def test_specialist_ocr_without_baseline_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
@@ -447,7 +449,7 @@ async def test_guarded_deepseek_without_baseline_requires_review(
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
     outcome, text, _, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+        db, Settings(prefer_clerk_ocr=True, ocr_profile=profile)
     )._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
@@ -455,21 +457,20 @@ async def test_guarded_deepseek_without_baseline_requires_review(
         MatchingOCRModel(),  # type: ignore[arg-type]
     )
 
-    assert outcome and outcome.status == "needs_review"
-    assert outcome.phase == "ocr_conflict"
-    assert "no existing Paperless baseline" in outcome.message
-    assert text == ""
-    assert updated["content"] == ""
-    assert paperless.patches == [{"tags": [99]}]
-    conflicts = db.list_conflicts()
-    assert len(conflicts) == 1
-    conflict = db.get_conflict(conflicts[0]["id"])
-    assert conflict is not None
-    assert conflict["existing_text"] == ""
-    assert "Acme issued this detailed monthly statement" in conflict["generated_text"]
-    assert conflict["metrics"]["guarded_review"] is True
+    assert outcome and outcome.status == "completed"
+    assert text == updated["content"]
+    assert "Acme issued this detailed monthly statement" in text
+    assert paperless.patches == [{"content": text}]
+    assert db.list_conflicts() == []
     events = db.get_job(job["id"], include_events=True)["events"]
-    assert "ocr_guarded_review" in {event["event_type"] for event in events}
+    configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
+    assert configuration["data"]["image_format"] == "jpeg"
+    assert configuration["data"]["prompt"] == (
+        "Free OCR." if profile == "deepseek_ocr" else "Text Recognition:"
+    )
+    assert configuration["data"]["decoding"] == (
+        {"temperature": 0, "top_k": 1} if profile == "deepseek_ocr" else {"temperature": 0}
+    )
 
 
 @pytest.mark.asyncio
@@ -530,17 +531,11 @@ async def test_less_complete_clerk_ocr_never_overwrites_an_existing_footer(
     configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
     assert configuration["data"]["model"] == "qwen2.5vl:7b"
     assert configuration["data"]["profile"] == "deepseek_ocr"
-    assert configuration["data"]["image_format"] == "png"
-    assert configuration["data"]["vllm_xargs"] == {
-        "ngram_size": 20,
-        "window_size": 90,
-        "whitelist_token_ids": [128821, 128822],
-    }
-    assert configuration["data"]["publication_policy"] == "existing_paperless_or_review"
-    assert (
-        configuration["data"]["completion_policy"]
-        == "discard_token_limited_or_repetition_stopped_output"
-    )
+    assert configuration["data"]["image_format"] == "jpeg"
+    assert configuration["data"]["prompt"] == "Free OCR."
+    assert configuration["data"]["decoding"] == {"temperature": 0, "top_k": 1}
+    assert "vllm_xargs" not in configuration["data"]
+    assert "publication_policy" not in configuration["data"]
 
 
 @pytest.mark.asyncio

@@ -62,16 +62,14 @@ crashed worker can resume work after restart.
 7. Re-fetch the Paperless document before publishing or comparing. If Paperless
    changed during inference, recheck the source hash; a changed source retries
    from its new pages, while a user-corrected OCR becomes the current comparison
-   input. If there is still no meaningful content, Clerk patches ordinary
-   assembled OCR. Output from a profile with a required content-changing guard
-   is held for review instead. Otherwise, a linear-time comparison combines
+   input. If there is still no meaningful content, Clerk patches the complete
+   assembled OCR. Otherwise, a linear-time comparison combines
    token multiset overlap, vocabulary overlap, ordered shingles, length
    agreement, and numeric-token agreement.
 8. Similar OCR selects Clerk or the existing Paperless content according to the
-   configured source preference. A guarded profile always retains existing
-   Paperless OCR. Divergent or unverified guarded OCR creates a
-   durable conflict containing both versions and comparison evidence, adds the
-   `ocr-conflict` tag, and stops before metadata classification.
+   configured source preference. Divergent OCR creates a durable conflict
+   containing both versions and comparison evidence, adds the `ocr-conflict`
+   tag, and stops before metadata classification.
 9. Conflict resolution re-fetches the live Paperless document. Keeping
    Paperless requires meaningful current OCR. Choosing Clerk is rejected if
    Paperless OCR changed after the review was created, so a later human edit is

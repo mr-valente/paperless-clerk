@@ -30,10 +30,11 @@ def test_output_budget_must_fit_model_context() -> None:
         Settings(metadata_context_tokens=4096, metadata_max_output_tokens=4096)
 
 
-def test_ocr_profile_defaults_to_generic_migrates_glm_and_rejects_unknown_values() -> None:
+def test_ocr_profile_defaults_to_generic_and_accepts_specialists() -> None:
     assert Settings().ocr_profile == "generic"
-    assert Settings(ocr_profile="glm_ocr").ocr_profile == "generic"
+    assert Settings(ocr_profile="deepseek_ocr").ocr_profile == "deepseek_ocr"
     assert Settings(ocr_profile="deepseek_ocr_llamacpp").ocr_profile == "deepseek_ocr_llamacpp"
+    assert Settings(ocr_profile="glm_ocr").ocr_profile == "glm_ocr"
     assert Settings().prefer_clerk_ocr is True
     with pytest.raises(ValueError, match="ocr_profile"):
         Settings(ocr_profile="some-other-model")
@@ -88,10 +89,10 @@ def test_ocr_profile_can_be_persisted_or_managed_by_environment(
     assert "ocr_profile" in restarted.get().public_dict()["environment_overrides"]
 
 
-def test_saved_glm_profile_migrates_without_blocking_startup() -> None:
+def test_saved_glm_profile_is_restored() -> None:
     settings = load_persisted_settings(json.dumps({"ocr_profile": "glm_ocr"}))
 
-    assert settings.ocr_profile == "generic"
+    assert settings.ocr_profile == "glm_ocr"
 
 
 def test_legacy_model_urls_migrate_to_one_shared_url() -> None:

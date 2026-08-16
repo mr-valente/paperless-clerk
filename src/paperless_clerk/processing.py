@@ -14,7 +14,6 @@ from typing import Any
 
 from paperless_clerk.clients.ntfy import NtfyClient
 from paperless_clerk.clients.openai_compatible import (
-    DEEPSEEK_VLLM_XARGS,
     OCR_REQUEST_CONTRACT_VERSION,
     ModelError,
     OpenAICompatibleClient,
@@ -25,11 +24,7 @@ from paperless_clerk.db import Database
 from paperless_clerk.domain.chunking import pages_from_assembled_text
 from paperless_clerk.domain.ocr_compare import assemble_pages, compare_ocr, meaningful_ocr
 from paperless_clerk.metadata import MetadataAnalyzer, MetadataPlanner, apply_metadata_plan
-from paperless_clerk.prompts import (
-    DEEPSEEK_FREE_OCR_PAGE_PROMPT,
-    DEEPSEEK_OCR_PAGE_PROMPT,
-    OCR_PAGE_PROMPT,
-)
+from paperless_clerk.prompts import ocr_prompt_for_profile
 from paperless_clerk.rendering import DocumentRenderer, RenderError
 
 log = logging.getLogger(__name__)
@@ -185,16 +180,12 @@ class DocumentProcessor:
         str,
     ]:
         self.database.update_job(job["id"], phase="downloading")
-        deepseek_vllm_profile = self.settings.ocr_profile == "deepseek_ocr"
-        deepseek_llamacpp_profile = self.settings.ocr_profile == "deepseek_ocr_llamacpp"
-        profile_prompt = (
-            DEEPSEEK_OCR_PAGE_PROMPT
-            if deepseek_vllm_profile
-            else DEEPSEEK_FREE_OCR_PAGE_PROMPT
-            if deepseek_llamacpp_profile
-            else OCR_PAGE_PROMPT
-        )
-        image_format = "png" if deepseek_vllm_profile else "jpeg"
+        deepseek_profile = self.settings.ocr_profile in {
+            "deepseek_ocr",
+            "deepseek_ocr_llamacpp",
+        }
+        profile_prompt = ocr_prompt_for_profile(self.settings.ocr_profile)
+        image_format = "jpeg"
         request_configuration: dict[str, Any] = {
             "contract_version": OCR_REQUEST_CONTRACT_VERSION,
             "model": self.settings.ocr_model,
@@ -207,16 +198,8 @@ class DocumentProcessor:
             "prompt": profile_prompt,
             "decoding": {"temperature": 0},
         }
-        if image_format == "jpeg":
-            request_configuration["jpeg_quality"] = self.settings.jpeg_quality
-        if deepseek_vllm_profile:
-            request_configuration["skip_special_tokens"] = False
-            request_configuration["vllm_xargs"] = dict(DEEPSEEK_VLLM_XARGS)
-            request_configuration["publication_policy"] = "existing_paperless_or_review"
-            request_configuration["completion_policy"] = (
-                "discard_token_limited_or_repetition_stopped_output"
-            )
-        elif deepseek_llamacpp_profile:
+        request_configuration["jpeg_quality"] = self.settings.jpeg_quality
+        if deepseek_profile:
             request_configuration["decoding"]["top_k"] = 1
         fingerprint = hashlib.sha256(
             json.dumps(
@@ -308,7 +291,7 @@ class DocumentProcessor:
         document = live_document
         existing = str(document.get("content") or "")
         has_paperless_ocr = meaningful_ocr(existing, self.settings.ocr_min_chars)
-        if not has_paperless_ocr and not deepseek_vllm_profile:
+        if not has_paperless_ocr:
             self.database.update_job(job["id"], phase="publishing_ocr")
             updated = await paperless.update_document(int(document["id"]), {"content": generated})
             self.database.add_event(
@@ -344,36 +327,25 @@ class DocumentProcessor:
                 or comparison.unmatched_existing_suffix_tokens >= 5
             )
         )
-        guarded_review = deepseek_vllm_profile and not has_paperless_ocr
-        allow_generated_publication = self.settings.prefer_clerk_ocr and not deepseek_vllm_profile
         selected_source = (
-            "manual_review"
-            if guarded_review
-            else "clerk"
-            if comparison.is_similar
-            and allow_generated_publication
-            and not coverage_safeguard
+            "clerk"
+            if comparison.is_similar and self.settings.prefer_clerk_ocr and not coverage_safeguard
             else "paperless"
             if comparison.is_similar
             else "manual_review"
         )
         self.database.add_event(
             job["id"],
-            (
-                "warning"
-                if guarded_review or coverage_safeguard or not comparison.is_similar
-                else "info"
-            ),
+            "warning" if coverage_safeguard or not comparison.is_similar else "info",
             "ocr_compared",
             f"OCR comparison score {comparison.score:.3f}; selected {selected_source.replace('_', ' ')}",
             {
                 **comparison.metrics(),
                 "selected_source": selected_source,
                 "coverage_safeguard": coverage_safeguard,
-                "guarded_review": guarded_review,
             },
         )
-        if comparison.is_similar and not guarded_review:
+        if comparison.is_similar:
             selected_text = existing
             selected_pages = pages_from_assembled_text(existing)
             if coverage_safeguard:
@@ -390,15 +362,7 @@ class DocumentProcessor:
                         "existing_coverage": comparison.existing_coverage,
                     },
                 )
-            elif deepseek_vllm_profile:
-                self.database.add_event(
-                    job["id"],
-                    "info",
-                    "ocr_guarded_retained_paperless",
-                    "Retained existing Paperless OCR; guarded DeepSeek output is advisory",
-                    {"profile": self.settings.ocr_profile, "score": comparison.score},
-                )
-            elif allow_generated_publication:
+            elif self.settings.prefer_clerk_ocr:
                 selected_text = generated
                 selected_pages = pages
                 if generated != existing:
@@ -423,18 +387,6 @@ class DocumentProcessor:
                 )
             return None, selected_text, selected_pages, document, source_hash
 
-        if guarded_review:
-            self.database.add_event(
-                job["id"],
-                "warning",
-                "ocr_guarded_review",
-                "DeepSeek OCR requires review because Paperless has no existing OCR baseline",
-                {
-                    "profile": self.settings.ocr_profile,
-                    "reason": "model_required_content_changing_repetition_guard",
-                },
-            )
-
         conflict_tag = await paperless.ensure_tag(self.settings.conflict_tag)
         tag_ids = {int(value) for value in document.get("tags", [])}
         tag_ids.add(int(conflict_tag["id"]))
@@ -446,7 +398,7 @@ class DocumentProcessor:
             existing_text=existing,
             generated_text=generated,
             score=comparison.score,
-            metrics={**comparison.metrics(), "guarded_review": guarded_review},
+            metrics=comparison.metrics(),
             diff=comparison.mismatch_snippets,
             tag_id=int(conflict_tag["id"]),
         )
@@ -454,12 +406,7 @@ class DocumentProcessor:
             ProcessOutcome(
                 "needs_review",
                 "ocr_conflict",
-                (
-                    "Guarded DeepSeek OCR has no existing Paperless baseline; review is "
-                    "required before metadata analysis"
-                    if guarded_review
-                    else "Existing and Clerk OCR differ; review is required before metadata analysis"
-                ),
+                "Existing and Clerk OCR differ; review is required before metadata analysis",
             ),
             existing,
             pages,
@@ -484,13 +431,7 @@ class DocumentProcessor:
             prior_attempts = int(existing.get(page_number, {}).get("attempts") or 0)
             started = time.monotonic()
             try:
-                prompt = (
-                    DEEPSEEK_OCR_PAGE_PROMPT
-                    if self.settings.ocr_profile == "deepseek_ocr"
-                    else DEEPSEEK_FREE_OCR_PAGE_PROMPT
-                    if self.settings.ocr_profile == "deepseek_ocr_llamacpp"
-                    else OCR_PAGE_PROMPT
-                )
+                prompt = ocr_prompt_for_profile(self.settings.ocr_profile)
                 text = await model.ocr_page(image, page_number=page_number, prompt=prompt)
                 duration = int((time.monotonic() - started) * 1000)
                 self.database.upsert_page(

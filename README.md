@@ -21,11 +21,9 @@ model can transcribe pages while a smaller text model handles classification.
 - Compares Clerk OCR with existing Paperless OCR using token, vocabulary,
   ordered-shingle, length, and numeric agreement.
 - Selects either Clerk or the existing Paperless OCR after a trusted match,
-  according to the configured preference. Profiles that require
-  content-changing decoding guards are review-only and never replace Paperless
-  OCR automatically.
-- Adds an `ocr-conflict` Paperless tag and retains the available readings when
-  they disagree or guarded OCR has no Paperless baseline.
+  according to the configured preference.
+- Adds an `ocr-conflict` Paperless tag and retains both complete readings when
+  they disagree.
 - Lets the user resolve a conflict side by side and resumes metadata processing
   only after that decision.
 - Classifies correspondents, document types, tags, titles, intrinsic dates, and
@@ -86,9 +84,7 @@ For a manual or discovered document:
    images while local OCR calls run.
 3. Completed pages are committed immediately to SQLite. A process restart or
    retry skips those pages if the source has not changed.
-4. If Paperless has no meaningful content, Clerk patches ordinary OCR output.
-   A guarded DeepSeek result instead creates a review item because Paperless has
-   no existing OCR baseline to retain.
+4. If Paperless has no meaningful content, Clerk patches the complete OCR output.
 5. If content exists, Clerk compares the two complete readings. A high score
    selects the configured preferred source (Clerk by default); a low score
    creates an intervention without replacing either reading automatically.
@@ -161,22 +157,17 @@ stack under **Settings → Vision OCR**:
 
 - **Generic vision model** keeps the normal request for Qwen and other
   instruction-following vision models.
-- **DeepSeek OCR vLLM profile** targets DeepSeek-OCR and DeepSeek-OCR-2 on
-  vLLM. It renders pages losslessly, then sends one image-first user message
-  containing DeepSeek's document task,
-  `<|grounding|>Convert the document to markdown.`, along with
-  `skip_special_tokens: false` and the model author's 20-token/90-token-window
-  n-gram guard.
-  Clerk removes DeepSeek's paired layout-class and coordinate annotations while
-  retaining the recognized Markdown text for comparison and review. Because
-  the required guard changes decoding, this profile never publishes OCR
-  automatically: existing Paperless OCR remains canonical, or a
-  review item is created when no baseline exists.
-- **DeepSeek OCR-2 GGUF via llama.cpp** reproduces Clerk's earlier request for
-  `sabafallah/DeepSeek-OCR-2-GGUF`: JPEG at the configured render resolution,
-  one image-first user message containing `Free OCR.`, temperature 0, and
-  `top_k: 1`. It deliberately sends no vLLM-only fields, but remains an
-  experimental A/B path rather than a fidelity guarantee.
+- **DeepSeek OCR-2 via vLLM** uses the native non-GGUF model. It sends a JPEG in
+  one image-first user message containing `Free OCR.`, with temperature 0 and
+  `top_k: 1`. It sends no custom chat template, special-token override,
+  logits-processor arguments, or `vllm_xargs`.
+- **DeepSeek OCR-2 GGUF via llama.cpp** is the known-good
+  `sabafallah/DeepSeek-OCR-2-GGUF` path. It deliberately uses the same request
+  as the native profile, keeping the request contract constant while comparing
+  the two serving paths.
+- **GLM-OCR via vLLM** sends one image-first user message containing GLM's exact
+  `Text Recognition:` task at temperature 0. It has no system prompt, page
+  prefix, reasoning parser, or custom chat template.
 
 Selecting the profile changes the OCR processing fingerprint, so a retried job
 will discard page results produced with a different request contract. The
@@ -187,49 +178,89 @@ of merely testing text chat. The check succeeds only when markers from all
 three regions are present, so reading the header while dropping the footer is a
 failure.
 
-#### vLLM serving recipe
+Upgrade note: an open conflict created by the former DeepSeek review-only
+policy remains open intentionally. Resolve it once from **Intervention** before
+retrying that document. Clerk does not auto-accept a stored OCR snapshot during
+an upgrade because the Paperless document may have changed since the review was
+created.
 
-Use a recent upstream vLLM release with native `DeepseekOCR2ForCausalLM`
-support:
+#### Lemonade vLLM recipes for Strix Halo
+
+These recipes use Lemonade's ROCm vLLM backend and native model support. Start
+with the minimal configuration; Lemonade manages the served model name, host,
+port, and vLLM `--max-model-len` argument. They follow the official
+[Lemonade vLLM backend guide](https://github.com/lemonade-sdk/lemonade/blob/main/docs/guide/configuration/vllm.md),
+[DeepSeek-OCR-2 model card](https://huggingface.co/deepseek-ai/DeepSeek-OCR-2),
+and [GLM-OCR vLLM recipe](https://docs.vllm.ai/projects/recipes/en/stable/GLM/GLM-OCR.html).
+
+DeepSeek-OCR-2:
 
 ```sh
-vllm serve deepseek-ai/DeepSeek-OCR-2 \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --max-model-len 8192 \
-  --logits_processors vllm.model_executor.models.deepseek_ocr:NGramPerReqLogitsProcessor \
-  --no-enable-prefix-caching \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image": 1}'
+lemonade backends install vllm:rocm
+lemonade pull user.DeepSeek-OCR-2 \
+  --checkpoint main deepseek-ai/DeepSeek-OCR-2 \
+  --recipe vllm \
+  --label vision
+lemonade load user.DeepSeek-OCR-2 --vllm rocm --ctx-size 8192 --save-options
 ```
 
-Then configure the endpoint or model router used by Clerk:
+This is deliberately the recovered, low-coupling Lemonade path: the request is
+kept identical to the known-good GGUF request while the native serving path is
+tested. The [current upstream vLLM DeepSeek example](https://docs.vllm.ai/en/v0.20.1/examples/offline_inference/vision_language/)
+uses an n-gram logits processor with per-request `vllm_xargs` and non-skipped
+special tokens to suppress repetition. Those server and request changes must be
+enabled as one matched contract; they are intentionally absent here because the
+partially configured processor path was the source of the broken profile. If
+the minimal native path loops to its token limit, use the known-good llama.cpp
+profile rather than adding only the server-side half of that processor setup.
 
 ```env
-CLERK_OPENAI_BASE_URL=http://your-vllm-host:8000/v1
-CLERK_OCR_MODEL=deepseek-ai/DeepSeek-OCR-2
+CLERK_OPENAI_BASE_URL=http://host.docker.internal:13305/v1
+CLERK_OCR_MODEL=user.DeepSeek-OCR-2
 CLERK_OCR_PROFILE=deepseek_ocr
+CLERK_OCR_CONTEXT_TOKENS=8192
+CLERK_OCR_MAX_OUTPUT_TOKENS=4096
 ```
 
-Current vLLM releases provide a built-in DeepSeek-OCR fallback chat template,
-which formats Clerk's image-first message as the model's native
-`<image>`-plus-document-task prompt. Clerk does not send a request-level
-`chat_template`, so neither `--chat-template` nor
-`--trust-request-chat-template` is needed. Leave request-template trust disabled.
+GLM-OCR:
 
-DeepSeek-OCR-2 does not reliably terminate under unguarded greedy decoding.
-Loading the vLLM processor is not enough: Clerk must also send its per-request
-`vllm_xargs`. Clerk uses DeepSeek's single-image `ngram_size: 20`,
-`window_size: 90`, and table-token whitelist. This is more aggressive than
-vLLM's generic online example because that example's `30/90` setting was not
-enough for the observed financial-letter loop. It is still not a lossless
-setting: the processor forbids a previously seen continuation and can therefore
-alter a legitimate exact repeated span. Clerk exposes that limitation instead
-of hiding it—DeepSeek output is advisory, token-limited responses are rejected,
-and only a human can promote guarded output when no existing Paperless OCR exists.
+```sh
+lemonade backends install vllm:rocm
+lemonade pull user.GLM-OCR-vLLM \
+  --checkpoint main zai-org/GLM-OCR \
+  --recipe vllm \
+  --label vision
+lemonade load user.GLM-OCR-vLLM --vllm rocm --ctx-size 16384 --save-options
+```
+
+```env
+CLERK_OPENAI_BASE_URL=http://host.docker.internal:13305/v1
+CLERK_OCR_MODEL=user.GLM-OCR-vLLM
+CLERK_OCR_PROFILE=glm_ocr
+CLERK_OCR_CONTEXT_TOKENS=16384
+CLERK_OCR_MAX_OUTPUT_TOKENS=8192
+CLERK_RENDER_DPI=200
+```
+
+The 16,384-token GLM context is a practical sizing recommendation for a full
+page plus an 8,192-token output, not an upstream model requirement. The direct
+vLLM recipe requires vLLM 0.19.0 or newer and Transformers 5.3.0 or newer; the
+current Lemonade RDNA bundle satisfies that vLLM floor.
+
+The model names above are Lemonade registration IDs, not Hugging Face IDs.
+Confirm them with `lemonade list` or `GET /v1/models` if an existing
+registration uses a different name. Neither model needs `--trust-remote-code`,
+a reasoning parser, or a request-supplied chat template on a current native
+vLLM build. GLM's MTP speculative decoding is optional acceleration and is
+intentionally omitted from this baseline.
+
+Lemonade's vLLM backend is Linux-only and requires its documented ROCm/CWSR
+kernel setup on Strix Halo. If loading reports an unsupported architecture,
+update Lemonade and reinstall `vllm:rocm`; older bundles predate native
+`DeepseekOCR2ForCausalLM` and `GlmOcrForConditionalGeneration` support.
 
 Clerk records the effective OCR model, profile, prompt, render settings, and
-completion policy in each job's event history. This makes an older successful
+decoding parameters in each job's event history. This makes an older successful
 configuration recoverable without relying on container logs or memory.
 
 #### Completeness limits
@@ -244,29 +275,20 @@ existing words, especially a trailing block. The job records the coverage and
 suffix counts. This safeguard prevents data loss; it cannot recover omitted
 text when no prior OCR exists.
 
-For documents where independent OCR completeness is mandatory, use a
-layout-aware pipeline that detects regions, crops each region, recognizes them
-separately, and merges reading order. The GLM-OCR SDK provides that architecture
-and can call an external OpenAI-compatible GLM model while its layout detector
-runs on CPU. Its stock configuration intentionally discards headers, footers,
-footnotes, page numbers, and several marginal-text classes, so an archival
-configuration must map those labels to the text task rather than accepting the
-defaults. This requires a separate SDK service and real hardware validation; a
-single full-page chat request is not an equivalent substitute.
+The direct GLM profile is model-only full-page recognition, matching Clerk's
+page-at-a-time architecture. The separate GLM-OCR SDK adds layout detection,
+region crops, and structured document parsing; use that pipeline outside Clerk
+when those capabilities are required.
 
-The original DeepSeek repository's pinned vLLM wheel and example scripts drive
-an in-process `AsyncLLMEngine`; they are not an OpenAI-compatible HTTP serving
-recipe. Clerk should point at `vllm serve` (or a compatible model router), not
-at those scripts. A bare vLLM process normally serves one base model. Because
-Clerk intentionally uses one shared OpenAI-compatible URL for OCR and metadata,
-that URL must also route the configured metadata model if it is hosted by a
-different vLLM worker.
+The original DeepSeek repository's pinned vLLM 0.8.5 scripts use an in-process
+engine and are not the Lemonade/OpenAI-compatible serving path documented here.
+Lemonade routes requests by registered model ID, which also lets Clerk keep its
+OCR and metadata models behind the one shared base URL.
 
 The profile cannot compensate for an older vLLM release that does not support
 the model architecture. Keep Clerk's per-page output limit below the server's
-available context budget. A token-limit error on a short page is evidence of a
-generation loop, not a reason to raise the limit; a larger limit only makes that
-failure slower.
+available context budget. Token-limited output is rejected rather than
+published as a partial page.
 
 Recommended endpoint characteristics:
 
@@ -298,8 +320,8 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_OPENAI_BASE_URL` | `http://host.docker.internal:11434/v1` | Shared local endpoint for OCR and metadata models |
 | `CLERK_OPENAI_API_KEY` | empty | Optional bearer token shared by both model clients |
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
-| `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic`, vLLM-oriented `deepseek_ocr`, or `deepseek_ocr_llamacpp` for the earlier GGUF stack |
-| `CLERK_PREFER_CLERK_OCR` | `true` | After a trusted OCR match, publish ordinary Clerk OCR; guarded DeepSeek vLLM output is always review-only |
+| `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic`, `deepseek_ocr`, `deepseek_ocr_llamacpp`, or `glm_ocr` |
+| `CLERK_PREFER_CLERK_OCR` | `true` | After a trusted OCR match, publish Clerk OCR instead of retaining existing Paperless OCR |
 | `CLERK_OCR_CONTEXT_TOKENS` | `8192` | Declared OCR context limit |
 | `CLERK_OCR_MAX_OUTPUT_TOKENS` | `4096` | Per-page OCR output cap |
 | `CLERK_METADATA_MODEL` | `qwen2.5:14b` | Metadata model name |
@@ -313,7 +335,7 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_METADATA_CONCURRENCY` | `1` | Metadata map calls within one document |
 | `CLERK_RENDER_DPI` | `160` | Initial page rendering DPI |
 | `CLERK_MAX_IMAGE_PIXELS` | `16000000` | Per-page pixel ceiling; DPI scales down to fit |
-| `CLERK_JPEG_QUALITY` | `86` | Rendered JPEG quality for generic and llama.cpp OCR; the DeepSeek vLLM profile uses lossless PNG |
+| `CLERK_JPEG_QUALITY` | `86` | Rendered page JPEG quality |
 | `CLERK_OCR_MIN_CHARS` | `24` | Minimum meaningful existing OCR size |
 | `CLERK_OCR_SIMILARITY_THRESHOLD` | `0.82` | Score required to choose either OCR source automatically |
 | `CLERK_CONFLICT_TAG` | `ocr-conflict` | Paperless review tag |
