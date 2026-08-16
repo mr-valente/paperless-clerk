@@ -12,14 +12,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from paperless_clerk.clients.openai_compatible import ModelError, OpenAICompatibleClient
+from paperless_clerk.clients.ntfy import NtfyClient
+from paperless_clerk.clients.openai_compatible import (
+    DEEPSEEK_VLLM_XARGS,
+    OCR_REQUEST_CONTRACT_VERSION,
+    ModelError,
+    OpenAICompatibleClient,
+)
 from paperless_clerk.clients.paperless import PaperlessClient, PaperlessError
 from paperless_clerk.config import Settings, SettingsManager
 from paperless_clerk.db import Database
 from paperless_clerk.domain.chunking import pages_from_assembled_text
 from paperless_clerk.domain.ocr_compare import assemble_pages, compare_ocr, meaningful_ocr
 from paperless_clerk.metadata import MetadataAnalyzer, MetadataPlanner, apply_metadata_plan
-from paperless_clerk.prompts import OCR_PAGE_PROMPT
+from paperless_clerk.prompts import (
+    DEEPSEEK_FREE_OCR_PAGE_PROMPT,
+    DEEPSEEK_OCR_PAGE_PROMPT,
+    OCR_PAGE_PROMPT,
+)
 from paperless_clerk.rendering import DocumentRenderer, RenderError
 
 log = logging.getLogger(__name__)
@@ -175,29 +185,65 @@ class DocumentProcessor:
         str,
     ]:
         self.database.update_job(job["id"], phase="downloading")
+        deepseek_vllm_profile = self.settings.ocr_profile == "deepseek_ocr"
+        deepseek_llamacpp_profile = self.settings.ocr_profile == "deepseek_ocr_llamacpp"
+        profile_prompt = (
+            DEEPSEEK_OCR_PAGE_PROMPT
+            if deepseek_vllm_profile
+            else DEEPSEEK_FREE_OCR_PAGE_PROMPT
+            if deepseek_llamacpp_profile
+            else OCR_PAGE_PROMPT
+        )
+        image_format = "png" if deepseek_vllm_profile else "jpeg"
+        request_configuration: dict[str, Any] = {
+            "contract_version": OCR_REQUEST_CONTRACT_VERSION,
+            "model": self.settings.ocr_model,
+            "profile": self.settings.ocr_profile,
+            "context_tokens": self.settings.ocr_context_tokens,
+            "max_output_tokens": self.settings.ocr_max_output_tokens,
+            "render_dpi": self.settings.render_dpi,
+            "max_image_pixels": self.settings.max_image_pixels,
+            "image_format": image_format,
+            "prompt": profile_prompt,
+            "decoding": {"temperature": 0},
+        }
+        if image_format == "jpeg":
+            request_configuration["jpeg_quality"] = self.settings.jpeg_quality
+        if deepseek_vllm_profile:
+            request_configuration["skip_special_tokens"] = False
+            request_configuration["vllm_xargs"] = dict(DEEPSEEK_VLLM_XARGS)
+            request_configuration["publication_policy"] = "existing_paperless_or_review"
+            request_configuration["completion_policy"] = (
+                "discard_token_limited_or_repetition_stopped_output"
+            )
+        elif deepseek_llamacpp_profile:
+            request_configuration["decoding"]["top_k"] = 1
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
                     "base_url": self.settings.openai_base_url,
-                    "model": self.settings.ocr_model,
-                    "profile": self.settings.ocr_profile,
-                    "context": self.settings.ocr_context_tokens,
-                    "max_output": self.settings.ocr_max_output_tokens,
-                    "render_dpi": self.settings.render_dpi,
-                    "max_image_pixels": self.settings.max_image_pixels,
-                    "jpeg_quality": self.settings.jpeg_quality,
-                    "prompt": OCR_PAGE_PROMPT,
+                    **request_configuration,
                 },
                 sort_keys=True,
             ).encode()
         ).hexdigest()
-        if job.get("ocr_fingerprint") and job["ocr_fingerprint"] != fingerprint:
+        previous_fingerprint = job.get("ocr_fingerprint")
+        if previous_fingerprint and previous_fingerprint != fingerprint:
             self.database.clear_pages(job["id"])
             self.database.add_event(
                 job["id"],
                 "warning",
                 "ocr_configuration_changed",
                 "OCR model or rendering configuration changed; saved page results were discarded",
+                request_configuration,
+            )
+        if previous_fingerprint != fingerprint:
+            self.database.add_event(
+                job["id"],
+                "info",
+                "ocr_configuration",
+                f"Using OCR model {self.settings.ocr_model} with profile {self.settings.ocr_profile}",
+                request_configuration,
             )
         self.database.update_job(job["id"], ocr_fingerprint=fingerprint)
         with tempfile.TemporaryDirectory(prefix="paperless-clerk-") as temp_directory:
@@ -218,6 +264,7 @@ class DocumentProcessor:
                 dpi=self.settings.render_dpi,
                 max_pixels=self.settings.max_image_pixels,
                 jpeg_quality=self.settings.jpeg_quality,
+                image_format=image_format,
             ) as renderer:
                 total = renderer.page_count
                 if total < 1:
@@ -260,7 +307,8 @@ class DocumentProcessor:
                 )
         document = live_document
         existing = str(document.get("content") or "")
-        if not meaningful_ocr(existing, self.settings.ocr_min_chars):
+        has_paperless_ocr = meaningful_ocr(existing, self.settings.ocr_min_chars)
+        if not has_paperless_ocr and not deepseek_vllm_profile:
             self.database.update_job(job["id"], phase="publishing_ocr")
             updated = await paperless.update_document(int(document["id"]), {"content": generated})
             self.database.add_event(
@@ -282,24 +330,75 @@ class DocumentProcessor:
 
         self.database.update_job(job["id"], phase="verifying_ocr")
         comparison = compare_ocr(existing, generated, self.settings.ocr_similarity_threshold)
+        # Similarity is symmetric, but replacement safety is not. If the new
+        # result omits a meaningful amount of text already present in
+        # Paperless, retain the system-of-record copy even when the overall
+        # document remains similar. Both OCR versions remain available in job
+        # diagnostics; no generated text is patched or heuristically repaired.
+        coverage_safeguard = bool(
+            comparison.is_similar
+            and self.settings.prefer_clerk_ocr
+            and comparison.existing_coverage < 0.98
+            and (
+                comparison.existing_missing_tokens >= 5
+                or comparison.unmatched_existing_suffix_tokens >= 5
+            )
+        )
+        guarded_review = deepseek_vllm_profile and not has_paperless_ocr
+        allow_generated_publication = self.settings.prefer_clerk_ocr and not deepseek_vllm_profile
         selected_source = (
-            "clerk"
-            if comparison.is_similar and self.settings.prefer_clerk_ocr
+            "manual_review"
+            if guarded_review
+            else "clerk"
+            if comparison.is_similar
+            and allow_generated_publication
+            and not coverage_safeguard
             else "paperless"
             if comparison.is_similar
             else "manual_review"
         )
         self.database.add_event(
             job["id"],
-            "info" if comparison.is_similar else "warning",
+            (
+                "warning"
+                if guarded_review or coverage_safeguard or not comparison.is_similar
+                else "info"
+            ),
             "ocr_compared",
             f"OCR comparison score {comparison.score:.3f}; selected {selected_source.replace('_', ' ')}",
-            {**comparison.metrics(), "selected_source": selected_source},
+            {
+                **comparison.metrics(),
+                "selected_source": selected_source,
+                "coverage_safeguard": coverage_safeguard,
+                "guarded_review": guarded_review,
+            },
         )
-        if comparison.is_similar:
+        if comparison.is_similar and not guarded_review:
             selected_text = existing
             selected_pages = pages_from_assembled_text(existing)
-            if self.settings.prefer_clerk_ocr:
+            if coverage_safeguard:
+                self.database.add_event(
+                    job["id"],
+                    "warning",
+                    "ocr_coverage_safeguard",
+                    "Retained Paperless OCR because Clerk omitted material existing text",
+                    {
+                        "existing_missing_tokens": comparison.existing_missing_tokens,
+                        "unmatched_existing_suffix_tokens": (
+                            comparison.unmatched_existing_suffix_tokens
+                        ),
+                        "existing_coverage": comparison.existing_coverage,
+                    },
+                )
+            elif deepseek_vllm_profile:
+                self.database.add_event(
+                    job["id"],
+                    "info",
+                    "ocr_guarded_retained_paperless",
+                    "Retained existing Paperless OCR; guarded DeepSeek output is advisory",
+                    {"profile": self.settings.ocr_profile, "score": comparison.score},
+                )
+            elif allow_generated_publication:
                 selected_text = generated
                 selected_pages = pages
                 if generated != existing:
@@ -324,6 +423,18 @@ class DocumentProcessor:
                 )
             return None, selected_text, selected_pages, document, source_hash
 
+        if guarded_review:
+            self.database.add_event(
+                job["id"],
+                "warning",
+                "ocr_guarded_review",
+                "DeepSeek OCR requires review because Paperless has no existing OCR baseline",
+                {
+                    "profile": self.settings.ocr_profile,
+                    "reason": "model_required_content_changing_repetition_guard",
+                },
+            )
+
         conflict_tag = await paperless.ensure_tag(self.settings.conflict_tag)
         tag_ids = {int(value) for value in document.get("tags", [])}
         tag_ids.add(int(conflict_tag["id"]))
@@ -335,7 +446,7 @@ class DocumentProcessor:
             existing_text=existing,
             generated_text=generated,
             score=comparison.score,
-            metrics=comparison.metrics(),
+            metrics={**comparison.metrics(), "guarded_review": guarded_review},
             diff=comparison.mismatch_snippets,
             tag_id=int(conflict_tag["id"]),
         )
@@ -343,7 +454,12 @@ class DocumentProcessor:
             ProcessOutcome(
                 "needs_review",
                 "ocr_conflict",
-                "Existing and Clerk OCR differ; review is required before metadata analysis",
+                (
+                    "Guarded DeepSeek OCR has no existing Paperless baseline; review is "
+                    "required before metadata analysis"
+                    if guarded_review
+                    else "Existing and Clerk OCR differ; review is required before metadata analysis"
+                ),
             ),
             existing,
             pages,
@@ -368,7 +484,14 @@ class DocumentProcessor:
             prior_attempts = int(existing.get(page_number, {}).get("attempts") or 0)
             started = time.monotonic()
             try:
-                text = await model.ocr_page(image, page_number=page_number, prompt=OCR_PAGE_PROMPT)
+                prompt = (
+                    DEEPSEEK_OCR_PAGE_PROMPT
+                    if self.settings.ocr_profile == "deepseek_ocr"
+                    else DEEPSEEK_FREE_OCR_PAGE_PROMPT
+                    if self.settings.ocr_profile == "deepseek_ocr_llamacpp"
+                    else OCR_PAGE_PROMPT
+                )
+                text = await model.ocr_page(image, page_number=page_number, prompt=prompt)
                 duration = int((time.monotonic() - started) * 1000)
                 self.database.upsert_page(
                     job["id"],
@@ -611,6 +734,7 @@ class JobManager:
         self._discovery_page = 2
         self._scan_backlog_next = False
         self._discovery_signature: tuple[str, str, int] | None = None
+        self._discovery_failure_active = False
 
     async def start(self) -> None:
         settings = self.settings_manager.get()
@@ -674,6 +798,11 @@ class JobManager:
                         outcome.phase,
                         outcome.message,
                     )
+                    await self._notify_job_issue(
+                        job,
+                        kind=outcome.phase,
+                        message=outcome.message or "Document processing requires review",
+                    )
                 else:
                     self.database.finish_job(job["id"], outcome.status, outcome.phase)
                     self.database.clear_pages(job["id"])
@@ -701,15 +830,84 @@ class JobManager:
                 )
                 if status == "failed":
                     self.database.update_document_state_status(int(job["document_id"]), "failed")
+                    await self._notify_job_issue(job, kind="failed", message=str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - final process boundary
                 log.exception("Unhandled processing error for job %s", job["id"])
-                self.database.fail_or_retry(job["id"], "internal_error", str(exc), False)
+                status = self.database.fail_or_retry(job["id"], "internal_error", str(exc), False)
                 self.database.update_document_state_status(int(job["document_id"]), "failed")
+                if status == "failed":
+                    await self._notify_job_issue(job, kind="failed", message=str(exc))
             finally:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _notify_job_issue(self, job: dict[str, Any], *, kind: str, message: str) -> None:
+        current = self.database.get_job(job["id"]) or job
+        document_id = int(current["document_id"])
+        document_title = str(current.get("document_title") or f"Document {document_id}")
+        if kind == "ocr_conflict":
+            title = "Paperless Clerk: OCR conflict"
+            tags = ("warning", "mag")
+        elif kind == "failed":
+            title = "Paperless Clerk: processing failed"
+            tags = ("x", "page_facing_up")
+        else:
+            title = "Paperless Clerk: review required"
+            tags = ("warning", "page_facing_up")
+        await self._publish_notification(
+            kind=kind,
+            title=title,
+            message=f"{document_title} (document #{document_id})\n{message}",
+            tags=tags,
+            job_id=str(job["id"]),
+        )
+
+    async def _publish_notification(
+        self,
+        *,
+        kind: str,
+        title: str,
+        message: str,
+        tags: tuple[str, ...],
+        job_id: str | None = None,
+    ) -> None:
+        settings = self.settings_manager.get()
+        if not settings.notifications_enabled:
+            return
+        client: NtfyClient | None = None
+        try:
+            client = NtfyClient(settings)
+            await client.publish(title=title, message=message, priority=4, tags=tags)
+            log.info("ntfy notification sent kind=%s job=%s", kind, job_id or "-")
+            if job_id:
+                self.database.add_event(
+                    job_id,
+                    "info",
+                    "notification_sent",
+                    "ntfy notification sent",
+                    {"kind": kind},
+                )
+        except Exception as exc:  # Notification delivery must not change a job outcome.
+            log.warning(
+                "ntfy notification failed kind=%s job=%s: %s",
+                kind,
+                job_id or "-",
+                str(exc),
+            )
+            if job_id:
+                self.database.add_event(
+                    job_id,
+                    "warning",
+                    "notification_failed",
+                    f"ntfy notification failed: {str(exc)[:800]}",
+                    {"kind": kind},
+                )
+        finally:
+            if client:
+                with contextlib.suppress(Exception):
+                    await client.close()
 
     async def _heartbeat(self, job_id: str, lease_seconds: int) -> None:
         while True:
@@ -769,12 +967,23 @@ class JobManager:
                                 "queued",
                             )
                             self.wake()
-                except Exception:
+                    self._discovery_failure_active = False
+                except Exception as exc:
                     # A shrinking result set can invalidate a later page. The
                     # next poll restarts safely from the newest documents.
                     self._discovery_page = 2
                     self._scan_backlog_next = False
                     log.warning("Automatic Paperless discovery failed", exc_info=True)
+                    if not self._discovery_failure_active:
+                        await self._publish_notification(
+                            kind="discovery_failed",
+                            title="Paperless Clerk: discovery failed",
+                            message=f"Automatic Paperless discovery failed: {str(exc)[:1000]}",
+                            tags=("warning", "satellite"),
+                        )
+                        self._discovery_failure_active = (
+                            self.settings_manager.get().notifications_enabled
+                        )
                 finally:
                     await paperless.close()
             with contextlib.suppress(TimeoutError):
@@ -800,6 +1009,21 @@ async def resolve_conflict(
     paperless = PaperlessClient(settings)
     try:
         document = await paperless.get_document(int(conflict["document_id"]))
+        live_content = str(document.get("content") or "")
+        if resolution == "keep_existing" and not meaningful_ocr(
+            live_content, settings.ocr_min_chars
+        ):
+            raise ProcessingError(
+                "no_existing_ocr",
+                "Paperless still has no meaningful OCR to keep. Add or correct OCR in "
+                "Paperless, then retry this choice, or explicitly choose Clerk OCR.",
+            )
+        if resolution == "use_clerk" and live_content != str(conflict["existing_text"] or ""):
+            raise ProcessingError(
+                "conflict_source_changed",
+                "Paperless OCR changed after this review was created. Clerk did not overwrite "
+                "the newer text; keep the current Paperless OCR or start a new comparison.",
+            )
         patch: dict[str, Any] = {}
         if resolution == "use_clerk":
             patch["content"] = conflict["generated_text"]

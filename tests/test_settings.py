@@ -33,6 +33,7 @@ def test_output_budget_must_fit_model_context() -> None:
 def test_ocr_profile_defaults_to_generic_migrates_glm_and_rejects_unknown_values() -> None:
     assert Settings().ocr_profile == "generic"
     assert Settings(ocr_profile="glm_ocr").ocr_profile == "generic"
+    assert Settings(ocr_profile="deepseek_ocr_llamacpp").ocr_profile == "deepseek_ocr_llamacpp"
     assert Settings().prefer_clerk_ocr is True
     with pytest.raises(ValueError, match="ocr_profile"):
         Settings(ocr_profile="some-other-model")
@@ -115,3 +116,21 @@ def test_legacy_model_urls_migrate_to_one_shared_url() -> None:
 def test_watch_tag_must_differ_from_conflict_tag() -> None:
     with pytest.raises(ValueError, match="must differ"):
         Settings(automation_tag="OCR-Conflict", conflict_tag="ocr-conflict")
+
+
+def test_ntfy_settings_require_a_valid_topic_and_keep_token_private() -> None:
+    with pytest.raises(ValueError, match="topic is required"):
+        Settings(notifications_enabled=True)
+    with pytest.raises(ValueError, match="may contain only"):
+        Settings(ntfy_topic="invalid topic/name")
+
+    settings = Settings(
+        notifications_enabled=True,
+        ntfy_topic="clerk_private-alerts",
+        ntfy_token="secret-token",
+    )
+
+    assert settings.persisted_dict()["ntfy_token"] == "secret-token"
+    assert "ntfy_token" not in settings.public_dict()
+    assert settings.public_dict()["ntfy_token_configured"] is True
+    assert "secret-token" not in str(settings.public_dict())

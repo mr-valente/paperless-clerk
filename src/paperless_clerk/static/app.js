@@ -7,11 +7,11 @@ const processForm = document.querySelector("#process-form");
 const state = { route: "overview", dashboard: null, jobs: [], interventions: null, decisions: [], settings: null, jobFilter: "all", poll: null };
 
 const pageMeta = {
-  overview: ["Your document desk", "Overview"],
-  jobs: ["Durable and resumable", "Processing"],
-  review: ["Human judgment", "Intervention"],
-  decisions: ["Transparent classification", "Recent decisions"],
-  settings: ["Useful controls only", "Settings"],
+  overview: ["Status", "Overview"],
+  jobs: ["Job queue", "Processing"],
+  review: ["Action required", "Intervention"],
+  decisions: ["Metadata history", "Decisions"],
+  settings: ["Configuration", "Settings"],
 };
 
 const appearanceStorageKey = "paperless-clerk-appearance";
@@ -90,12 +90,11 @@ function emptyState(icon, title, text) { return `<div class="empty-state"><div><
 function docThumb(id) { return `<span class="doc-thumb"><img src="/api/documents/${id}/thumbnail" alt="" loading="lazy" onerror="this.remove();this.parentElement.textContent='${id}'" /></span>`; }
 
 function jobRow(job, actions = true) {
-  const active = ["running", "queued", "retry_wait"].includes(job.status);
   const retry = ["failed", "needs_review", "cancelled"].includes(job.status) && job.phase !== "ocr_conflict";
   return `<article class="job-row clickable" data-action="job-detail" data-id="${job.id}">
     ${docThumb(job.document_id)}
-    <div class="row-title"><strong>${escapeHtml(job.document_title || `Document ${job.document_id}`)}</strong><small>#${job.document_id} · ${escapeHtml(titleCase(job.mode))}</small>${active && job.progress_total ? `<div class="progress-track"><i style="width:${job.progress_percent}%"></i></div>` : ""}</div>
-    <div class="row-meta"><strong>${escapeHtml(titleCase(job.phase))}</strong><br /><span>${job.progress_total ? `${job.progress_current} / ${job.progress_total}` : `Attempt ${job.attempt}/${job.max_attempts}`}</span></div>
+    <div class="row-title"><strong>${escapeHtml(job.document_title || `Document ${job.document_id}`)}</strong><small>#${job.document_id} · ${escapeHtml(titleCase(job.mode))}</small>${job.status === "running" ? `<div class="progress-track indeterminate" role="progressbar" aria-label="Processing"><i></i></div>` : ""}</div>
+    <div class="row-meta"><strong>${escapeHtml(titleCase(job.phase))}</strong><br /><span>${job.progress_total ? `${job.progress_current} / ${job.progress_total} OCR pages` : `Attempt ${job.attempt}/${job.max_attempts}`}</span></div>
     <div>${statusChip(job.status)}</div>
     ${actions ? `<div class="row-actions">${retry ? `<button class="button ghost small" data-action="retry-job" data-id="${job.id}">Retry</button>` : ""}${["queued", "retry_wait"].includes(job.status) ? `<button class="button ghost small" data-action="cancel-job" data-id="${job.id}">Cancel</button>` : ""}</div>` : ""}
   </article>`;
@@ -183,7 +182,7 @@ function setBadge(id, count) {
 }
 
 async function renderRoute({ quiet = false } = {}) {
-  if (!quiet) content.innerHTML = `<div class="initial-loader"><span class="loader-mark"></span><p>Checking the desk…</p></div>`;
+  if (!quiet) content.innerHTML = `<div class="initial-loader"><span class="loader-mark"></span><p>Loading…</p></div>`;
   try {
     if (state.route === "overview") await renderOverview();
     else await refreshDashboard();
@@ -192,7 +191,7 @@ async function renderRoute({ quiet = false } = {}) {
     if (state.route === "decisions") await renderDecisions();
     if (state.route === "settings") await renderSettings();
   } catch (error) {
-    if (!quiet) content.innerHTML = `<div class="panel">${emptyState("!", "The desk could not be loaded", error.message)}</div>`;
+    if (!quiet) content.innerHTML = `<div class="panel">${emptyState("!", "Could not load page", error.message)}</div>`;
   }
   updateChrome();
 }
@@ -207,30 +206,25 @@ async function renderOverview() {
   const { counts, jobs, conflicts, decisions } = state.dashboard;
   content.innerHTML = `
     <section class="grid metrics">
-      <article class="metric-card"><span class="metric-icon">↻</span><span class="metric-label">In progress</span><div class="metric-value">${counts.active}</div><span class="metric-note">${counts.queued} waiting in the durable queue</span></article>
-      <article class="metric-card warning"><span class="metric-icon">◇</span><span class="metric-label">Needs attention</span><div class="metric-value">${counts.open_conflicts + counts.needs_review}</div><span class="metric-note">${counts.open_conflicts} OCR conflicts to inspect</span></article>
-      <article class="metric-card"><span class="metric-icon">✓</span><span class="metric-label">Decisions today</span><div class="metric-value">${counts.decisions_today}</div><span class="metric-note">Concise rationale retained</span></article>
-      <article class="metric-card ${counts.failed ? "error" : ""}"><span class="metric-icon">!</span><span class="metric-label">Exhausted retries</span><div class="metric-value">${counts.failed}</div><span class="metric-note">Nothing fails silently</span></article>
+      <article class="metric-card"><span class="metric-icon">↻</span><span class="metric-label">In progress</span><div class="metric-value">${counts.active}</div><span class="metric-note">${counts.queued} queued</span></article>
+      <article class="metric-card warning"><span class="metric-icon">◇</span><span class="metric-label">Needs attention</span><div class="metric-value">${counts.open_conflicts + counts.needs_review}</div><span class="metric-note">${counts.open_conflicts} OCR conflicts</span></article>
+      <article class="metric-card"><span class="metric-icon">✓</span><span class="metric-label">Decisions today</span><div class="metric-value">${counts.decisions_today}</div><span class="metric-note">Metadata decisions recorded</span></article>
+      <article class="metric-card ${counts.failed ? "error" : ""}"><span class="metric-icon">!</span><span class="metric-label">Failed jobs</span><div class="metric-value">${counts.failed}</div><span class="metric-note">${counts.failed ? "Review required" : "No failed jobs"}</span></article>
     </section>
     <section class="grid overview-grid">
       <div>
-        <article class="panel desk-note">
-          <p class="eyebrow">The next filing run</p><h2>Turn scanned pages into trustworthy, organized documents.</h2>
-          <p>Clerk reads page by page, verifies existing OCR, then fits each document into the metadata vocabulary you already use.</p>
-          <div class="desk-actions"><button class="button primary" data-action="open-process">Process documents</button><a class="button ghost" href="#settings">Check connections</a></div>
-        </article>
         <article class="panel">
-          <header class="panel-head"><div><h2>Processing desk</h2><p>Live status from the durable queue</p></div><a href="#jobs" class="panel-link">View all</a></header>
+          <header class="panel-head"><div><h2>Recent jobs</h2><p>OCR and metadata processing status</p></div><a href="#jobs" class="panel-link">View all</a></header>
           <div class="status-list">${jobs.length ? jobs.map((job) => jobRow(job, false)).join("") : emptyState("↻", "The queue is clear", "Run documents manually or enable automatic discovery in Settings.")}</div>
         </article>
       </div>
       <div>
         <article class="panel">
-          <header class="panel-head"><div><h2>On your desk</h2><p>Items that need human judgment</p></div>${conflicts.length ? `<a href="#review" class="panel-link">Review all</a>` : ""}</header>
+          <header class="panel-head"><div><h2>Intervention</h2><p>Items requiring review</p></div>${conflicts.length ? `<a href="#review" class="panel-link">Review all</a>` : ""}</header>
           <div class="status-list">${conflicts.length ? conflicts.map(conflictRow).join("") : emptyState("✓", "Nothing needs review", "OCR disagreements and exhausted jobs will appear here.")}</div>
         </article>
         <article class="panel">
-          <header class="panel-head"><div><h2>Recent filing decisions</h2><p>What Clerk changed, reused, or withheld</p></div><a href="#decisions" class="panel-link">History</a></header>
+          <header class="panel-head"><div><h2>Recent decisions</h2><p>Applied and withheld metadata changes</p></div><a href="#decisions" class="panel-link">History</a></header>
           <div class="status-list">${decisions.length ? decisions.slice(0, 4).map(decisionRow).join("") : emptyState("⌁", "No decisions yet", "Metadata decisions appear after the first completed analysis.")}</div>
         </article>
       </div>
@@ -245,7 +239,7 @@ async function renderJobs() {
     if (state.jobFilter === "active") return ["running", "queued", "retry_wait"].includes(job.status);
     return job.status === state.jobFilter;
   });
-  content.innerHTML = `<section class="page-intro"><div><h2>Every run has a durable paper trail</h2><p>Page progress, retries, and model or Paperless errors survive restarts. One difficult document never blocks the rest of the queue.</p></div><div class="actions"><button class="button primary" data-action="open-process">＋ Process documents</button></div></section>
+  content.innerHTML = `<section class="page-intro"><div><h2>Processing jobs</h2><p>Current and previous OCR and metadata jobs.</p></div><div class="actions"><button class="button primary" data-action="open-process">＋ Process documents</button></div></section>
     <section class="panel"><div class="toolbar"><div class="filter-tabs">${filters.map((filter) => `<button class="${filter === state.jobFilter ? "active" : ""}" data-action="job-filter" data-filter="${filter}">${titleCase(filter)}</button>`).join("")}</div><span class="spacer"></span><input class="search-input" id="job-search" type="search" placeholder="Filter by document or ID" /></div><div class="status-list" id="job-list">${filtered.length ? filtered.map(jobRow).join("") : emptyState("↻", "No matching jobs", "Try another filter or start a processing run.")}</div></section>`;
 }
 
@@ -254,8 +248,8 @@ async function renderReview() {
   const { conflicts, failed_jobs: failed, review_jobs: review } = state.interventions;
   const nonConflictReview = review.filter((job) => job.phase !== "ocr_conflict");
   const count = conflicts.length + failed.length + nonConflictReview.length;
-  content.innerHTML = `<section class="page-intro"><div><h2>${count ? `${count} item${count === 1 ? "" : "s"} waiting for you` : "The intervention desk is clear"}</h2><p>Clerk pauses whenever choosing automatically could destroy trustworthy text or hide a persistent failure.</p></div></section>
-    ${conflicts.length ? `<div class="alert-banner"><span>◇</span><div><strong>OCR conflicts are intentionally unresolved</strong><p>Compare both readings and choose; metadata analysis will resume afterward.</p></div></div>` : ""}
+  content.innerHTML = `<section class="page-intro"><div><h2>Intervention</h2><p>${count ? `${count} item${count === 1 ? "" : "s"} require attention.` : "No items require attention."}</p></div></section>
+    ${conflicts.length ? `<div class="alert-banner"><span>◇</span><div><strong>OCR conflicts require review</strong><p>Compare both versions and select the correct text.</p></div></div>` : ""}
     <section class="grid review-grid">
       <article class="panel"><header class="panel-head"><div><h2>OCR conflicts</h2><p>Existing Paperless text versus Clerk vision OCR</p></div>${statusChip(conflicts.length ? "open" : "completed")}</header><div class="status-list">${conflicts.length ? conflicts.map(conflictRow).join("") : emptyState("✓", "No OCR conflicts", "Formatting-only differences are accepted automatically.")}</div></article>
       <article class="panel"><header class="panel-head"><div><h2>Errors & retries</h2><p>Runs that exhausted bounded retries</p></div>${failed.length || nonConflictReview.length ? statusChip("failed") : statusChip("completed")}</header><div class="status-list">${failed.length || nonConflictReview.length ? [...failed, ...nonConflictReview].map(jobRow).join("") : emptyState("✓", "No exhausted jobs", "Transient failures retry automatically before appearing here.")}</div></article>
@@ -264,7 +258,7 @@ async function renderReview() {
 
 async function renderDecisions() {
   state.decisions = await api("/api/decisions?limit=250");
-  content.innerHTML = `<section class="page-intro"><div><h2>Classification you can account for</h2><p>Each entry separates canonical reuse, genuinely new vocabulary, withheld changes, confidence filtering, and near-duplicates considered.</p></div></section><section class="panel"><div class="toolbar"><span class="muted">${state.decisions.length} retained decision${state.decisions.length === 1 ? "" : "s"}</span><span class="spacer"></span><input class="search-input" id="decision-search" type="search" placeholder="Filter document decisions" /></div><div class="status-list" id="decision-list">${state.decisions.length ? state.decisions.map(decisionRow).join("") : emptyState("⌁", "No metadata decisions yet", "Complete a full or metadata-only run to populate this history.")}</div></section>`;
+  content.innerHTML = `<section class="page-intro"><div><h2>Metadata decisions</h2><p>Applied changes, omitted candidates, and classification details.</p></div></section><section class="panel"><div class="toolbar"><span class="muted">${state.decisions.length} retained decision${state.decisions.length === 1 ? "" : "s"}</span><span class="spacer"></span><input class="search-input" id="decision-search" type="search" placeholder="Filter document decisions" /></div><div class="status-list" id="decision-list">${state.decisions.length ? state.decisions.map(decisionRow).join("") : emptyState("⌁", "No metadata decisions yet", "Complete a full or metadata-only run to populate this history.")}</div></section>`;
 }
 
 function settingInput(name, label, value, options = {}) {
@@ -285,30 +279,37 @@ function settingCheck(name, title, description, checked) {
   return `<label class="check-row ${locked ? "locked" : ""}"><input type="checkbox" name="${name}" ${checked ? "checked" : ""} ${locked ? "disabled" : ""} /><span><strong>${escapeHtml(title)}</strong><small class="${locked ? "environment-note" : ""}">${escapeHtml(note)}</small></span></label>`;
 }
 
+function settingToggle(name, title, description, checked) {
+  const locked = Boolean(state.settings?.environment_overrides?.includes(name));
+  const note = locked ? "Managed by an environment variable; remove it and restart to edit here." : description;
+  return `<label class="toggle-row ${locked ? "locked" : ""}"><span><strong>${escapeHtml(title)}</strong><small class="${locked ? "environment-note" : ""}">${escapeHtml(note)}</small></span><span class="toggle-control"><input type="checkbox" name="${name}" ${checked ? "checked" : ""} ${locked ? "disabled" : ""} /><i aria-hidden="true"></i></span></label>`;
+}
+
 function ocrProfileSetting(profile) {
-  const selected = profile === "deepseek_ocr" ? profile : "generic";
-  const locked = Boolean(state.settings?.environment_overrides?.includes("ocr_profile"));
-  return `<fieldset class="profile-setting full ${locked ? "locked" : ""}">
-    <legend>Specialist request profile</legend>
-    <input id="setting-ocr_profile" type="hidden" name="ocr_profile" value="${selected}" ${locked ? "disabled" : ""} />
-    <div class="profile-options"><label class="profile-choice"><input type="checkbox" data-ocr-profile="deepseek_ocr" ${selected === "deepseek_ocr" ? "checked" : ""} ${locked ? "disabled" : ""} /><span><strong>DeepSeek OCR / OCR 2 profile</strong><small>Uses DeepSeek's plain OCR mode without chat or grounded-layout scaffolding.</small></span></label></div>
-    <small class="profile-help ${locked ? "environment-note" : ""}">${locked ? "Managed by an environment variable; remove it and restart to edit here." : "Leave unchecked for general vision models such as Qwen."}</small>
-  </fieldset>`;
+  const supported = ["generic", "deepseek_ocr", "deepseek_ocr_llamacpp"];
+  const selected = supported.includes(profile) ? profile : "generic";
+  return settingInput("ocr_profile", "Request profile", selected, {
+    type: "select",
+    full: true,
+    choices: [["generic", "Generic vision model"], ["deepseek_ocr", "DeepSeek OCR vLLM (guarded, review-only)"], ["deepseek_ocr_llamacpp", "DeepSeek OCR-2 GGUF via llama.cpp (experimental)"]],
+    note: "DeepSeek's vLLM profile requires a content-changing loop guard, so Clerk never publishes its output automatically; it retains existing Paperless OCR or asks for review."
+  });
 }
 
 async function renderSettings() {
   state.settings = await api("/api/settings");
   const s = state.settings;
   applyAppearance(s);
-  content.innerHTML = `<section class="page-intro"><div><h2>Connect Clerk to your local stack</h2><p>OCR and metadata use one OpenAI-compatible endpoint with independently selected models. Secrets stay server-side and are never returned to this browser. Save changed values before testing a connection.</p></div></section>
+  content.innerHTML = `<section class="page-intro"><div><h2>Settings</h2><p>Configure Paperless, model endpoints, automation, notifications, and interface options. Save changed values before testing a connection.</p></div></section>
     <div class="settings-layout">
-      <nav class="settings-nav"><a href="#settings-paperless">Paperless</a><a href="#settings-ai">Local AI API</a><a href="#settings-ocr">Vision OCR</a><a href="#settings-metadata">Metadata model</a><a href="#settings-workflow">Automation & filing</a><a href="#settings-appearance">Appearance</a><a href="#settings-advanced">Limits & reliability</a></nav>
+      <nav class="settings-nav"><a href="#settings-paperless">Paperless</a><a href="#settings-ai">Local AI API</a><a href="#settings-ocr">Vision OCR</a><a href="#settings-metadata">Metadata model</a><a href="#settings-workflow">Automation & filing</a><a href="#settings-notifications">Notifications</a><a href="#settings-appearance">Appearance</a><a href="#settings-advanced">Limits & reliability</a></nav>
       <form class="settings-form" id="settings-form">
-        <section class="panel settings-section" id="settings-paperless"><header class="panel-head"><div><h3>Paperless-ngx</h3><p class="section-description">System of record and the only external application Clerk modifies.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="paperless">Test connection</button></header><div class="panel-body"><div class="form-grid">${settingInput("paperless_url", "Paperless URL", s.paperless_url, { full: true, note: "Root URL or a URL ending in /api." })}${settingInput("paperless_token", "API token", "", { type: "password", configured: s.paperless_token_configured })}</div>${settingCheck("paperless_verify_ssl", "Verify TLS certificates", "Disable only for a trusted local endpoint with a self-signed certificate.", s.paperless_verify_ssl)}</div></section>
+        <section class="panel settings-section" id="settings-paperless"><header class="panel-head"><div><h3>Paperless-ngx</h3><p class="section-description">Paperless API connection.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="paperless">Test connection</button></header><div class="panel-body"><div class="form-grid">${settingInput("paperless_url", "Paperless URL", s.paperless_url, { full: true, note: "Root URL or a URL ending in /api." })}${settingInput("paperless_token", "API token", "", { type: "password", configured: s.paperless_token_configured })}</div>${settingCheck("paperless_verify_ssl", "Verify TLS certificates", "Disable only for a trusted local endpoint with a self-signed certificate.", s.paperless_verify_ssl)}</div></section>
         <section class="panel settings-section" id="settings-ai"><header class="panel-head"><div><h3>OpenAI-compatible API</h3><p class="section-description">One local endpoint and credential shared by both Clerk models.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("openai_base_url", "Base URL", s.openai_base_url, { full: true, note: "Usually ends in /v1; Clerk appends /chat/completions." })}${settingInput("openai_api_key", "API key", "", { type: "password", configured: s.openai_api_key_configured, full: true })}</div></div></section>
-        <section class="panel settings-section" id="settings-ocr"><header class="panel-head"><div><h3>Vision OCR model</h3><p class="section-description">Receives one rendered page image per request through the shared API.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="ocr">Test OCR model</button></header><div class="panel-body"><div class="form-grid">${settingInput("ocr_model", "Model name", s.ocr_model, { full: true })}${ocrProfileSetting(s.ocr_profile)}<div class="ocr-preference">${settingCheck("prefer_clerk_ocr", "Prefer Clerk OCR after a trusted match", "Enabled by default. When the OCR versions meet the trust threshold, publish Clerk's result; otherwise retain Paperless's existing text. A low match always goes to manual review.", s.prefer_clerk_ocr)}</div>${settingInput("ocr_context_tokens", "Context limit", s.ocr_context_tokens, { type: "number", min: 1024 })}${settingInput("ocr_max_output_tokens", "Maximum output tokens", s.ocr_max_output_tokens, { type: "number", min: 256 })}</div></div></section>
+        <section class="panel settings-section" id="settings-ocr"><header class="panel-head"><div><h3>Vision OCR model</h3><p class="section-description">Receives one rendered page image per request through the shared API.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="ocr">Test OCR model</button></header><div class="panel-body"><div class="form-grid">${settingInput("ocr_model", "Model name", s.ocr_model, { full: true })}${ocrProfileSetting(s.ocr_profile)}<div class="ocr-preference">${settingCheck("prefer_clerk_ocr", "Prefer Clerk OCR after a trusted match", "Applies to generic vision models. The guarded DeepSeek vLLM profile always retains existing Paperless OCR or creates a review item instead of replacing content automatically.", s.prefer_clerk_ocr)}</div>${settingInput("ocr_context_tokens", "Context limit", s.ocr_context_tokens, { type: "number", min: 1024 })}${settingInput("ocr_max_output_tokens", "Maximum output tokens", s.ocr_max_output_tokens, { type: "number", min: 256 })}</div></div></section>
         <section class="panel settings-section" id="settings-metadata"><header class="panel-head"><div><h3>Metadata model</h3><p class="section-description">Receives bounded OCR chunks and returns structured classification decisions.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="metadata">Test metadata model</button></header><div class="panel-body"><div class="form-grid">${settingInput("metadata_model", "Model name", s.metadata_model, { full: true })}${settingInput("metadata_context_tokens", "Context limit", s.metadata_context_tokens, { type: "number", min: 2048 })}${settingInput("metadata_max_output_tokens", "Maximum output tokens", s.metadata_max_output_tokens, { type: "number", min: 256 })}</div></div></section>
         <section class="panel settings-section" id="settings-workflow"><header class="panel-head"><div><h3>Automation & filing</h3><p class="section-description">Control discovery and conservative vocabulary growth.</p></div></header><div class="panel-body"><div class="check-grid">${settingCheck("automation_enabled", "Automatically process Paperless documents", "Polls Paperless for unseen or subsequently modified documents and queues full OCR plus metadata jobs. Add a queue tag below to make automation opt-in per document.", s.automation_enabled)}${settingCheck("allow_new_tags", "Allow distinct new tags", "Creates broad reusable subjects when the first document of a genuinely new category arrives; near-duplicates still normalize to existing tags.", s.allow_new_tags)}${settingCheck("allow_new_correspondents", "Allow distinct correspondents", "Aliases and abbreviations are aggressively canonicalized.", s.allow_new_correspondents)}${settingCheck("allow_new_document_types", "Allow stable document types", "Specific or synonymous variants are rejected.", s.allow_new_document_types)}${settingCheck("allow_new_custom_fields", "Allow new custom-field definitions", "Experimental and intentionally disabled by default.", s.allow_new_custom_fields)}</div><div class="form-grid">${settingInput("automation_tag", "Paperless queue tag (optional)", s.automation_tag, { full: true, note: "When set, only documents carrying this tag are discovered. Clerk hides it from the model, keeps it on failures or OCR conflicts, and removes it after metadata succeeds." })}${settingInput("automation_interval_seconds", "Discovery interval (seconds)", s.automation_interval_seconds, { type: "number", min: 15 })}${settingInput("metadata_apply_mode", "Existing metadata policy", s.metadata_apply_mode, { type: "select", choices: [["missing_only", "Preserve existing values"], ["overwrite", "Allow confident replacement"]], note: "Tags remain additive in both modes." })}</div></div></section>
+        <section class="panel settings-section" id="settings-notifications"><header class="panel-head"><div><h3>Notifications</h3><p class="section-description">ntfy alerts for failures and items requiring intervention.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="notifications">Send test</button></header><div class="panel-body">${settingToggle("notifications_enabled", "Enable ntfy notifications", "Sends alerts for terminal job failures, OCR conflicts, other review states, and Paperless discovery failures. Successful jobs do not generate notifications.", s.notifications_enabled)}<div class="form-grid">${settingInput("ntfy_url", "ntfy server URL", s.ntfy_url, { full: true, note: "Use https://ntfy.sh unless you run your own ntfy server." })}${settingInput("ntfy_topic", "Topic", s.ntfy_topic, { full: true })}${settingInput("ntfy_token", "Access token (optional)", "", { type: "password", configured: s.ntfy_token_configured, full: true })}</div></div></section>
         <section class="panel settings-section" id="settings-appearance"><header class="panel-head"><div><h3>Appearance</h3><p class="section-description">Personalize this browser without changing Paperless or processing behavior.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("appearance_theme", "Color theme", s.appearance_theme, { type: "select", choices: [["system", "Follow system"], ["light", "Light"], ["dark", "Dark"]], note: "Previewed immediately and saved for all Clerk sessions." })}${settingInput("appearance_density", "Interface density", s.appearance_density, { type: "select", choices: [["comfortable", "Comfortable"], ["compact", "Compact"]] })}${settingInput("appearance_motion", "Animation and motion", s.appearance_motion, { type: "select", choices: [["system", "Follow system"], ["full", "Full motion"], ["reduced", "Reduced motion"]], full: true, note: "Reduced motion minimizes transitions, loaders, and drawer animation." })}</div></div></section>
         <section class="panel settings-section" id="settings-advanced"><header class="panel-head"><div><h3>Limits & reliability</h3><p class="section-description">Bound memory and inference without imposing a document page limit.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("page_concurrency", "Concurrent OCR pages", s.page_concurrency, { type: "number", min: 1, max: 16 })}${settingInput("metadata_concurrency", "Concurrent metadata chunks", s.metadata_concurrency, { type: "number", min: 1, max: 8 })}${settingInput("job_workers", "Document workers", s.job_workers, { type: "number", min: 1, max: 8, note: "Changing this requires a restart." })}${settingInput("job_max_attempts", "Whole-job attempts", s.job_max_attempts, { type: "number", min: 1, max: 10 })}${settingInput("model_max_retries", "Request retries", s.model_max_retries, { type: "number", min: 0, max: 10 })}${settingInput("request_timeout_seconds", "Request timeout (seconds)", s.request_timeout_seconds, { type: "number", min: 10 })}${settingInput("render_dpi", "Page render DPI", s.render_dpi, { type: "number", min: 72, max: 400 })}${settingInput("max_image_pixels", "Maximum page pixels", s.max_image_pixels, { type: "number", min: 1000000 })}${settingInput("ocr_similarity_threshold", "OCR trust threshold", s.ocr_similarity_threshold, { type: "number", min: 0.5, max: 0.99 })}${settingInput("ocr_min_chars", "Meaningful OCR characters", s.ocr_min_chars, { type: "number", min: 1 })}${settingInput("metadata_chunk_chars", "Metadata chunk characters", s.metadata_chunk_chars, { type: "number", min: 2000 })}${settingInput("metadata_candidate_limit", "Vocabulary candidates per type", s.metadata_candidate_limit, { type: "number", min: 10, max: 500 })}${settingInput("metadata_min_confidence", "Minimum metadata confidence", s.metadata_min_confidence, { type: "number", min: 0, max: 1 })}${settingInput("log_level", "Container log detail", s.log_level, { type: "select", choices: [["DEBUG", "Debug"], ["INFO", "Info (recommended)"], ["WARNING", "Warnings only"], ["ERROR", "Errors only"]], full: true, note: "Clerk lifecycle and decision counts appear at Info. Changing this requires a restart." })}</div></div></section>
         <div class="settings-save"><p>Appearance previews immediately. Processing changes apply to newly claimed jobs.</p><button class="button primary" type="submit">Save settings</button></div>
@@ -328,11 +329,11 @@ async function showJob(id) {
   try {
     const job = await api(`/api/jobs/${id}`);
     openDrawer(`${drawerHeader(`Paperless document #${job.document_id}`, job.document_title || `Document ${job.document_id}`)}<div class="drawer-body">
-      <section class="detail-section"><div class="detail-grid"><div class="detail-stat"><span>Status</span><strong>${titleCase(job.status)}</strong></div><div class="detail-stat"><span>Scope</span><strong>${titleCase(job.mode)}</strong></div><div class="detail-stat"><span>Attempt</span><strong>${job.attempt} / ${job.max_attempts}</strong></div><div class="detail-stat"><span>Phase</span><strong>${titleCase(job.phase)}</strong></div><div class="detail-stat"><span>Progress</span><strong>${job.progress_total ? `${job.progress_current} / ${job.progress_total}` : "—"}</strong></div><div class="detail-stat"><span>Started</span><strong>${relativeTime(job.started_at)}</strong></div></div></section>
+      <section class="detail-section"><div class="detail-grid"><div class="detail-stat"><span>Status</span><strong>${titleCase(job.status)}</strong></div><div class="detail-stat"><span>Scope</span><strong>${titleCase(job.mode)}</strong></div><div class="detail-stat"><span>Attempt</span><strong>${job.attempt} / ${job.max_attempts}</strong></div><div class="detail-stat"><span>Phase</span><strong>${titleCase(job.phase)}</strong></div><div class="detail-stat"><span>OCR pages</span><strong>${job.progress_total ? `${job.progress_current} / ${job.progress_total}` : "—"}</strong></div><div class="detail-stat"><span>Started</span><strong>${relativeTime(job.started_at)}</strong></div></div></section>
       ${job.error_message ? `<section class="detail-section"><h3>Last error</h3><div class="resolution-box"><p class="danger-text">${escapeHtml(job.error_message)}</p></div></section>` : ""}
       ${job.page_failures?.length ? `<section class="detail-section"><h3>Page failures</h3><div class="change-list">${job.page_failures.map((page) => `<div class="change"><i>!</i><div><strong>Page ${page.page_number} · ${escapeHtml(titleCase(page.status))}</strong><small>${escapeHtml(page.error || "No page error detail was returned.")} · ${page.attempts} attempt${page.attempts === 1 ? "" : "s"}</small></div></div>`).join("")}</div></section>` : ""}
       <section class="detail-section"><h3>Run events</h3><div class="event-list">${job.events.length ? job.events.map((event) => `<div class="event ${event.level}"><strong>${escapeHtml(titleCase(event.event_type))}</strong><span>${fullTime(event.created_at)}</span><p>${escapeHtml(event.message)}</p></div>`).join("") : `<p class="muted">No events retained.</p>`}</div></section>
-      <div class="resolution-actions"><a class="button ghost" href="${escapeHtml((state.dashboard?.paperless_url || "").replace(/\/$/, ""))}/documents/${job.document_id}/details" target="_blank" rel="noreferrer">Open in Paperless ↗</a>${["failed", "needs_review", "cancelled"].includes(job.status) && job.phase !== "ocr_conflict" ? `<button class="button secondary" data-action="retry-job" data-id="${job.id}">Retry job</button>` : ""}</div>
+      <div class="resolution-actions">${job.decision_id ? `<button class="button primary" data-action="decision-detail" data-id="${job.decision_id}">View decision</button>` : ""}<a class="button ghost" href="${escapeHtml((state.dashboard?.paperless_url || "").replace(/\/$/, ""))}/documents/${job.document_id}/details" target="_blank" rel="noreferrer">Open in Paperless ↗</a>${["failed", "needs_review", "cancelled"].includes(job.status) && job.phase !== "ocr_conflict" ? `<button class="button secondary" data-action="retry-job" data-id="${job.id}">Retry job</button>` : ""}</div>
     </div>`);
   } catch (error) { toast("Could not load job", error.message, "error"); closeDrawer(); }
 }
@@ -342,11 +343,18 @@ async function showConflict(id) {
   try {
     const item = await api(`/api/conflicts/${id}`);
     const metrics = [["Overall match", item.score], ["Token overlap", item.metrics.token_overlap], ["Reading order", item.metrics.ordered_shingle_overlap], ["Number agreement", item.metrics.numeric_overlap], ["Length agreement", item.metrics.length_agreement]];
+    const hasPaperlessSnapshot = Boolean(item.existing_text?.trim());
+    const paperlessLabel = hasPaperlessSnapshot ? "Paperless OCR at review creation" : "No Paperless OCR at review creation";
+    const paperlessText = hasPaperlessSnapshot ? item.existing_text : "Paperless had no meaningful OCR when this review was created.";
+    const keepLabel = hasPaperlessSnapshot ? "Keep current Paperless OCR" : "Use OCR now in Paperless";
+    const resolutionHelp = hasPaperlessSnapshot
+      ? "Keeping Paperless uses its current OCR. Choosing Clerk is allowed only if Paperless OCR has not changed since this review was created. A successful choice removes the conflict tag and queues metadata."
+      : "Paperless had no OCR baseline. Add meaningful OCR in Paperless before choosing it, or explicitly choose Clerk OCR. An invalid or stale choice leaves this review open.";
     openDrawer(`${drawerHeader(`Paperless document #${item.document_id}`, item.document_title || `Document ${item.document_id}`)}<div class="drawer-body">
       <section class="detail-section"><h3>Comparison signals</h3><div class="detail-grid">${metrics.map(([name, value]) => `<div class="detail-stat"><span>${name}</span><strong>${Math.round(Number(value) * 100)}%</strong><div class="metric-bar"><i style="width:${Math.round(Number(value) * 100)}%"></i></div></div>`).join("")}</div></section>
-      <section class="detail-section"><h3>Both complete OCR versions</h3><div class="text-compare"><div class="text-pane"><header>Existing Paperless OCR</header><pre>${escapeHtml(item.existing_text)}</pre></div><div class="text-pane"><header>Clerk vision OCR</header><pre>${escapeHtml(item.generated_text)}</pre></div></div></section>
+      <section class="detail-section"><h3>OCR review versions</h3><div class="text-compare"><div class="text-pane"><header>${escapeHtml(paperlessLabel)}</header><pre>${escapeHtml(paperlessText)}</pre></div><div class="text-pane"><header>Clerk vision OCR</header><pre>${escapeHtml(item.generated_text)}</pre></div></div></section>
       ${item.diff?.length ? `<section class="detail-section"><h3>Sample mismatches</h3><div class="diff-list">${item.diff.map((diff) => `<div class="diff-item"><b>${escapeHtml(diff.operation)}</b><p><strong>Paperless:</strong> ${escapeHtml(diff.existing)}</p><p><strong>Clerk:</strong> ${escapeHtml(diff.generated)}</p></div>`).join("")}</div></section>` : ""}
-      <section class="resolution-box"><h3>Choose the trustworthy reading</h3><p>Keeping Paperless leaves its OCR byte-for-byte unchanged. Choosing Clerk replaces only the OCR content field. Either choice removes the conflict tag and queues metadata analysis.</p><div class="resolution-actions"><button class="button ghost" data-action="resolve-conflict" data-id="${item.id}" data-resolution="keep_existing">Keep Paperless OCR</button><button class="button primary" data-action="resolve-conflict" data-id="${item.id}" data-resolution="use_clerk">Use Clerk OCR</button><a class="button ghost" href="${escapeHtml((state.dashboard?.paperless_url || "").replace(/\/$/, ""))}/documents/${item.document_id}/details" target="_blank" rel="noreferrer">Open document ↗</a></div></section>
+      <section class="resolution-box"><h3>Choose the trustworthy reading</h3><p>${escapeHtml(resolutionHelp)}</p><div class="resolution-actions"><button class="button ghost" data-action="resolve-conflict" data-id="${item.id}" data-resolution="keep_existing">${escapeHtml(keepLabel)}</button><button class="button primary" data-action="resolve-conflict" data-id="${item.id}" data-resolution="use_clerk">Use Clerk OCR</button><a class="button ghost" href="${escapeHtml((state.dashboard?.paperless_url || "").replace(/\/$/, ""))}/documents/${item.document_id}/details" target="_blank" rel="noreferrer">Open document ↗</a></div></section>
     </div>`);
   } catch (error) { toast("Could not load conflict", error.message, "error"); closeDrawer(); }
 }
@@ -412,7 +420,7 @@ document.addEventListener("click", async (event) => {
   if (action === "cancel-job") { event.stopPropagation(); try { await api(`/api/jobs/${target.dataset.id}/cancel`, { method: "POST" }); toast("Job cancelled"); await renderRoute({ quiet: true }); } catch (error) { toast("Cancel failed", error.message, "error"); } }
   if (action === "resolve-conflict") resolveConflict(target.dataset.id, target.dataset.resolution);
   if (action === "job-filter") { state.jobFilter = target.dataset.filter; renderJobs(); }
-  if (action === "test-connection") { target.disabled = true; const old = target.textContent; target.textContent = "Testing…"; try { const result = await api(`/api/settings/test/${target.dataset.target}`, { method: "POST" }); toast("Connection succeeded", result.model ? `${result.model}: ${result.response}` : `${result.documents} Paperless documents visible`); } catch (error) { toast("Connection failed", error.message, "error"); } finally { target.disabled = false; target.textContent = old; } }
+  if (action === "test-connection") { target.disabled = true; const old = target.textContent; const testName = target.dataset.target === "ocr" ? "OCR test" : target.dataset.target === "notifications" ? "Notification test" : "Connection"; target.textContent = "Testing…"; try { const result = await api(`/api/settings/test/${target.dataset.target}`, { method: "POST" }); const detail = result.message || (result.model ? `${result.model}: ${result.response}` : `${result.documents} Paperless documents visible`); toast(`${testName} succeeded`, detail); } catch (error) { toast(`${testName} failed`, error.message, "error"); } finally { target.disabled = false; target.textContent = old; } }
   if (action === "reprocess-metadata") { try { await enqueue([Number(target.dataset.documentId)], "metadata"); closeDrawer(); } catch (error) { toast("Could not queue metadata", error.message, "error"); } }
 });
 
@@ -437,13 +445,13 @@ content.addEventListener("submit", async (event) => {
   const locked = new Set(state.settings?.environment_overrides || []);
   const numeric = new Set(["ocr_context_tokens", "ocr_max_output_tokens", "metadata_context_tokens", "metadata_max_output_tokens", "automation_interval_seconds", "page_concurrency", "metadata_concurrency", "job_workers", "job_max_attempts", "model_max_retries", "request_timeout_seconds", "render_dpi", "max_image_pixels", "ocr_min_chars", "metadata_chunk_chars", "metadata_candidate_limit"]);
   const decimal = new Set(["ocr_similarity_threshold", "metadata_min_confidence"]);
-  const checks = ["paperless_verify_ssl", "prefer_clerk_ocr", "automation_enabled", "allow_new_tags", "allow_new_correspondents", "allow_new_document_types", "allow_new_custom_fields"];
+  const checks = ["paperless_verify_ssl", "prefer_clerk_ocr", "automation_enabled", "allow_new_tags", "allow_new_correspondents", "allow_new_document_types", "allow_new_custom_fields", "notifications_enabled"];
   for (const [key, value] of data.entries()) {
     if (key.startsWith("clear_")) continue;
     values[key] = numeric.has(key) ? Number.parseInt(value, 10) : decimal.has(key) ? Number.parseFloat(value) : value;
   }
   for (const key of checks) if (!locked.has(key)) values[key] = data.get(key) === "on";
-  for (const key of ["paperless_token", "openai_api_key"]) {
+  for (const key of ["paperless_token", "openai_api_key", "ntfy_token"]) {
     if (data.get(`clear_${key}`) === "on") values[key] = "";
     else if (!values[key]) delete values[key];
   }
@@ -466,16 +474,6 @@ content.addEventListener("input", (event) => {
 
 content.addEventListener("change", (event) => {
   if (event.target.form?.id !== "settings-form") return;
-  if (event.target.matches("[data-ocr-profile]")) {
-    const hidden = event.target.form.querySelector('[name="ocr_profile"]');
-    if (!hidden) return;
-    const selected = event.target.checked ? event.target.dataset.ocrProfile : "generic";
-    hidden.value = selected;
-    event.target.form.querySelectorAll("[data-ocr-profile]").forEach((choice) => {
-      choice.checked = selected !== "generic" && choice.dataset.ocrProfile === selected;
-    });
-    return;
-  }
   if (!event.target.name?.startsWith("appearance_")) return;
   const form = new FormData(event.target.form);
   applyAppearance({

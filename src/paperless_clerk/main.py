@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from paperless_clerk import __version__
+from paperless_clerk.clients.ntfy import NotificationError, NtfyClient
 from paperless_clerk.clients.openai_compatible import ModelError, OpenAICompatibleClient
 from paperless_clerk.clients.paperless import PaperlessClient, PaperlessError
 from paperless_clerk.config import SettingsManager, data_directory
@@ -60,9 +61,6 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "lease_until",
     ):
         result[field] = _timestamp(result.get(field))
-    total = int(result.get("progress_total") or 0)
-    current = int(result.get("progress_current") or 0)
-    result["progress_percent"] = round((current / total) * 100) if total else 0
     if "events" in result:
         for event in result["events"]:
             event["created_at"] = _timestamp(event.get("created_at"))
@@ -324,11 +322,13 @@ async def test_settings(target: str, request: Request) -> dict[str, Any]:
         client = PaperlessClient(settings)
     elif target in {"ocr", "metadata"}:
         client = OpenAICompatibleClient(settings, target)
+    elif target == "notifications":
+        client = NtfyClient(settings)
     else:
         raise HTTPException(status_code=404, detail="Unknown connection target")
     try:
         return await client.test_connection()
-    except (PaperlessError, ModelError) as exc:
+    except (PaperlessError, ModelError, NotificationError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         await client.close()

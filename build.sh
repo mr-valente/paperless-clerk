@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-DEFAULT_VERSION="v0.1"
+DEFAULT_VERSION="v0.1.1"
 IMAGE_NAME="valentemath/paperless-clerk"
 
 usage() {
@@ -28,13 +28,15 @@ if [[ ! "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
     exit 1
 fi
 
+APP_VERSION="${VERSION#v}"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LATEST_IMAGE="$IMAGE_NAME:latest"
 VERSION_IMAGE="$IMAGE_NAME:$VERSION"
 
 echo "Building $LATEST_IMAGE with version $VERSION..."
 sudo docker build \
-    --label "org.opencontainers.image.version=$VERSION" \
+    --build-arg "PAPERLESS_CLERK_VERSION=$APP_VERSION" \
     --tag "$LATEST_IMAGE" \
     "$SCRIPT_DIR"
 

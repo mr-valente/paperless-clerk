@@ -5,8 +5,11 @@ Use [illegible] for text that cannot be read. Return only the transcription."""
 
 # OCR-specialist models are trained against terse task commands rather than a
 # general instruction-following conversation. The image content part supplies
-# the model's image marker, so this string deliberately omits <image>.
-DEEPSEEK_OCR_PAGE_PROMPT = "Free OCR."
+# the model's image marker, so this string deliberately omits <image>. DeepSeek
+# documents Free OCR as the layout-free mode; full document pages use its
+# grounded Markdown task.
+DEEPSEEK_OCR_PAGE_PROMPT = "<|grounding|>Convert the document to markdown."
+DEEPSEEK_FREE_OCR_PAGE_PROMPT = "Free OCR."
 
 
 METADATA_SYSTEM_PROMPT = """You are Paperless Clerk's controlled-vocabulary classifier.

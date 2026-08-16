@@ -24,7 +24,7 @@ class Settings(BaseModel):
     openai_base_url: str = "http://host.docker.internal:11434/v1"
     openai_api_key: SecretStr = SecretStr("")
     ocr_model: str = "qwen2.5vl:7b"
-    ocr_profile: Literal["generic", "deepseek_ocr"] = "generic"
+    ocr_profile: Literal["generic", "deepseek_ocr", "deepseek_ocr_llamacpp"] = "generic"
     prefer_clerk_ocr: bool = True
     ocr_context_tokens: int = Field(default=8192, ge=1024, le=1_000_000)
     ocr_max_output_tokens: int = Field(default=4096, ge=256, le=131_072)
@@ -63,13 +63,18 @@ class Settings(BaseModel):
     automation_page_size: int = Field(default=25, ge=1, le=100)
     automation_tag: str = Field(default="", max_length=100)
 
+    notifications_enabled: bool = False
+    ntfy_url: str = "https://ntfy.sh"
+    ntfy_topic: str = Field(default="", max_length=64)
+    ntfy_token: SecretStr = SecretStr("")
+
     appearance_theme: Literal["system", "light", "dark"] = "system"
     appearance_density: Literal["comfortable", "compact"] = "comfortable"
     appearance_motion: Literal["system", "full", "reduced"] = "system"
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
-    @field_validator("paperless_url", "openai_base_url")
+    @field_validator("paperless_url", "openai_base_url", "ntfy_url")
     @classmethod
     def normalize_url(cls, value: str) -> str:
         value = value.strip().rstrip("/")
@@ -81,6 +86,19 @@ class Settings(BaseModel):
     @classmethod
     def normalize_tag(cls, value: str) -> str:
         return " ".join(value.split())
+
+    @field_validator("ntfy_topic")
+    @classmethod
+    def validate_ntfy_topic(cls, value: str) -> str:
+        value = value.strip()
+        if value and any(
+            not (character.isascii() and character.isalnum()) and character not in "-_"
+            for character in value
+        ):
+            raise ValueError(
+                "ntfy topic may contain only letters, numbers, dashes, and underscores"
+            )
+        return value
 
     @field_validator("ocr_profile", mode="before")
     @classmethod
@@ -94,6 +112,8 @@ class Settings(BaseModel):
     def keep_chunks_inside_context(self) -> Settings:
         if self.automation_tag and self.automation_tag.casefold() == self.conflict_tag.casefold():
             raise ValueError("automation watch tag must differ from the OCR conflict tag")
+        if self.notifications_enabled and not self.ntfy_topic:
+            raise ValueError("an ntfy topic is required when notifications are enabled")
         if self.ocr_max_output_tokens >= self.ocr_context_tokens:
             raise ValueError("OCR maximum output tokens must be smaller than its context limit")
         if self.metadata_max_output_tokens >= self.metadata_context_tokens:
@@ -123,14 +143,18 @@ class Settings(BaseModel):
         data = self.model_dump(mode="json")
         data["paperless_token"] = self.paperless_token.get_secret_value()
         data["openai_api_key"] = self.openai_api_key.get_secret_value()
+        data["ntfy_token"] = self.ntfy_token.get_secret_value()
         return data
 
     def public_dict(self) -> dict[str, Any]:
-        data = self.model_dump(mode="json", exclude={"paperless_token", "openai_api_key"})
+        data = self.model_dump(
+            mode="json", exclude={"paperless_token", "openai_api_key", "ntfy_token"}
+        )
         data.update(
             {
                 "paperless_token_configured": bool(self.paperless_token.get_secret_value()),
                 "openai_api_key_configured": bool(self.openai_api_key.get_secret_value()),
+                "ntfy_token_configured": bool(self.ntfy_token.get_secret_value()),
                 # Names only: this lets the UI explain why a container-managed
                 # value is read-only without exposing any environment secrets.
                 "environment_overrides": sorted(environment_values()),
@@ -177,6 +201,10 @@ ENVIRONMENT_FIELDS = {
     "CLERK_AUTOMATION_INTERVAL_SECONDS": "automation_interval_seconds",
     "CLERK_AUTOMATION_PAGE_SIZE": "automation_page_size",
     "CLERK_AUTOMATION_TAG": "automation_tag",
+    "CLERK_NOTIFICATIONS_ENABLED": "notifications_enabled",
+    "CLERK_NTFY_URL": "ntfy_url",
+    "CLERK_NTFY_TOPIC": "ntfy_topic",
+    "CLERK_NTFY_TOKEN": "ntfy_token",
     "CLERK_LOG_LEVEL": "log_level",
 }
 

@@ -383,6 +383,11 @@ class Database:
                 return None
             result = dict(row)
             if include_events:
+                decision = connection.execute(
+                    "SELECT id FROM decisions WHERE job_id=? ORDER BY created_at DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                result["decision_id"] = str(decision["id"]) if decision else None
                 result["events"] = [
                     self._event_row(item)
                     for item in connection.execute(

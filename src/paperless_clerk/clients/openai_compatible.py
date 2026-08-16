@@ -9,8 +9,21 @@ from typing import Any
 import httpx
 
 from paperless_clerk.config import Settings
-from paperless_clerk.prompts import DEEPSEEK_OCR_PAGE_PROMPT
+from paperless_clerk.prompts import DEEPSEEK_FREE_OCR_PAGE_PROMPT, DEEPSEEK_OCR_PAGE_PROMPT
 from paperless_clerk.rendering import render_ocr_test_image
+
+OCR_REQUEST_CONTRACT_VERSION = 5
+
+# DeepSeek-OCR-2 does not terminate reliably under greedy decoding alone.  This
+# is the model author's single-image setting (the PDF runner uses the same
+# 20-token guard with a shorter search window).  It is deliberately kept as
+# named request metadata because vLLM's server-loaded adapter is a no-op unless
+# the per-request values arrive in vllm_xargs.
+DEEPSEEK_VLLM_XARGS = {
+    "ngram_size": 20,
+    "window_size": 90,
+    "whitelist_token_ids": [128821, 128822],
+}
 
 
 class ModelError(RuntimeError):
@@ -130,22 +143,32 @@ class OpenAICompatibleClient:
         reason = choices[0].get("finish_reason")
         return str(reason) if reason is not None else None
 
+    @staticmethod
+    def _image_media_type(image: bytes) -> str:
+        return "image/png" if image.startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
+
     async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
         encoded = base64.b64encode(image).decode("ascii")
+        image_media_type = self._image_media_type(image)
         image_content = {
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            "image_url": {"url": f"data:{image_media_type};base64,{encoded}"},
         }
-        if self.ocr_profile == "deepseek_ocr":
-            # DeepSeek-OCR and DeepSeek-OCR-2 share this plain-text OCR task.
-            # Grounded Markdown mode emits layout/coordinate artifacts that do
-            # not belong in Paperless's canonical OCR text field.
+        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
+            # DeepSeek documents this grounded Markdown task for full pages;
+            # its Free OCR task is the layout-free mode used by the historical
+            # llama.cpp/GGUF profile.
+            specialist_prompt = (
+                DEEPSEEK_OCR_PAGE_PROMPT
+                if self.ocr_profile == "deepseek_ocr"
+                else DEEPSEEK_FREE_OCR_PAGE_PROMPT
+            )
             messages = [
                 {
                     "role": "user",
                     "content": [
                         image_content,
-                        {"type": "text", "text": DEEPSEEK_OCR_PAGE_PROMPT},
+                        {"type": "text", "text": specialist_prompt},
                     ],
                 }
             ]
@@ -171,13 +194,35 @@ class OpenAICompatibleClient:
             "max_tokens": self.max_output_tokens,
             "messages": messages,
         }
-        if self.ocr_profile != "generic":
-            # llama.cpp recommends greedy-ish decoding for DeepSeek OCR.
+        if self.ocr_profile == "deepseek_ocr":
+            # DeepSeek's published vLLM paths require its custom n-gram logits
+            # processor. Without these per-request arguments, the loaded
+            # adapter does nothing and even small pages can generate forever.
+            # This processor can change a legitimate repeated span, so the
+            # processing layer treats this profile as guarded/review-only
+            # rather than silently making it canonical Paperless OCR.
+            payload["skip_special_tokens"] = False
+            payload["vllm_xargs"] = dict(DEEPSEEK_VLLM_XARGS)
+        elif self.ocr_profile == "deepseek_ocr_llamacpp":
+            # This reproduces the earlier known-good llama.cpp/GGUF request.
+            # top_k=1 makes decoding deterministic without imposing a
+            # content-changing repetition penalty or no-repeat rule.
             payload["top_k"] = 1
         body = await self._post(payload)
-        if self._finish_reason(body) in {"length", "max_tokens"}:
+        finish_reason = self._finish_reason(body)
+        if finish_reason in {"length", "max_tokens"}:
+            if self.ocr_profile == "deepseek_ocr":
+                raise ModelError(
+                    f"DeepSeek OCR output for page {page_number} reached the token limit "
+                    "despite its required vLLM loop guard; runaway partial output was "
+                    "discarded. Increasing the token limit would only prolong this failure."
+                )
             raise ModelError(
                 f"OCR output for page {page_number} reached the configured token limit"
+            )
+        if finish_reason in {"repetition", "repetition_detected"}:
+            raise ModelError(
+                f"OCR output for page {page_number} entered a repetition loop and was discarded"
             )
         text = self._content(body)
         text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -187,14 +232,36 @@ class OpenAICompatibleClient:
             text,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        if self.ocr_profile == "deepseek_ocr":
-            # Be defensive if a DeepSeek server returns grounded annotations
-            # despite the plain OCR prompt: retain recognized text, discard only
-            # the model-specific reference and coordinate scaffolding.
-            text = re.sub(r"<\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
-            text = re.sub(r"<\|/?ref\|>", "", text)
+        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
+            # Grounded document output prefixes recognized blocks with a paired
+            # layout-class reference and coordinate annotation. DeepSeek's own
+            # post-processor removes the entire pair; keeping the reference body
+            # would leak labels such as "text" and "sub_title" into OCR text.
+            annotation_pattern = re.compile(
+                r"<\|ref\|>.*?<\|/ref\|>\s*<\|det\|>.*?<\|/det\|>", re.DOTALL
+            )
+            layout_annotation_count = len(annotation_pattern.findall(text))
+            text = annotation_pattern.sub("", text)
+            # A partial pair has ambiguous contents: unwrapping it could publish
+            # a layout class such as `text` or `sub_title` as document text.
+            # DeepSeek's reference post-processor only removes complete pairs,
+            # so fail closed on malformed control-token output.
+            if re.search(r"<\|/?(?:ref|det)\|>", text):
+                raise ModelError("OCR model returned malformed layout annotations")
             text = text.replace("<|grounding|>", "")
+            text = text.replace("<｜end▁of▁sentence｜>", "")
+            text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
+            text = re.sub(r"\n(?:[ \t]*\n){2,}", "\n\n", text)
         if not text.strip():
+            if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"} and (
+                layout_annotation_count
+            ):
+                reason = finish_reason or "unspecified"
+                raise ModelError(
+                    "OCR model returned "
+                    f"{layout_annotation_count} layout region(s) but no transcription text "
+                    f"(finish reason: {reason})"
+                )
             raise ModelError(
                 "OCR model returned no transcription after removing response scaffolding"
             )
@@ -248,22 +315,39 @@ class OpenAICompatibleClient:
 
     async def test_connection(self) -> dict[str, Any]:
         if self.purpose == "ocr":
+            image_format = "png" if self.ocr_profile == "deepseek_ocr" else "jpeg"
             text = await self.ocr_page(
-                render_ocr_test_image(),
+                render_ocr_test_image(image_format),
                 page_number=1,
                 prompt="Transcribe the clearly printed test text.",
             )
-            if "clerk" not in text.casefold():
+            normalized = re.sub(r"\s+", " ", text.casefold())
+            required_regions = {
+                "header": "paperless clerk",
+                "body reference": "4827",
+                "footer": "end of clerk ocr test",
+            }
+            missing_regions = [
+                name for name, marker in required_regions.items() if marker not in normalized
+            ]
+            if missing_regions:
                 raise ModelError(
-                    "OCR model responded but did not read the test image; check the selected "
-                    "profile and matching multimodal projector"
+                    "OCR model responded but missed test image region(s): "
+                    f"{', '.join(missing_regions)}. Check the selected profile and matching "
+                    "multimodal projector."
                 )
-            return {
+            result = {
                 "ok": True,
                 "model": self.model,
                 "profile": self.ocr_profile,
                 "response": text[:80],
             }
+            if self.ocr_profile == "deepseek_ocr":
+                result["message"] = (
+                    "OCR responded using DeepSeek's required loop guard. This profile is "
+                    "review-only and will not replace Paperless OCR automatically."
+                )
+            return result
         body = await self._post(
             {
                 "model": self.model,

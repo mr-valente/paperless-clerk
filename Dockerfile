@@ -3,13 +3,17 @@ FROM ghcr.io/astral-sh/uv:0.12.3 AS uv
 
 FROM python:3.12-slim-bookworm AS runtime
 
+ARG PAPERLESS_CLERK_VERSION=0.1.0
+
 LABEL org.opencontainers.image.title="Paperless Clerk" \
-      org.opencontainers.image.description="Local-AI document intelligence for Paperless-ngx"
+      org.opencontainers.image.description="Local-AI document intelligence for Paperless-ngx" \
+      org.opencontainers.image.version="${PAPERLESS_CLERK_VERSION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    PAPERLESS_CLERK_VERSION=${PAPERLESS_CLERK_VERSION} \
     CLERK_DATA_DIR=/app/data \
     CLERK_HOST=0.0.0.0 \
     CLERK_PORT=8080 \

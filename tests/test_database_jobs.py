@@ -104,7 +104,7 @@ def test_ocr_conflict_is_not_double_counted_as_generic_review(tmp_path: Path) ->
 def test_decision_lists_expose_counts_not_evidence_details(tmp_path: Path) -> None:
     db = database(tmp_path)
     job, _ = db.enqueue_job(106, "metadata", 3)
-    db.add_decision(
+    decision_id = db.add_decision(
         job_id=job["id"],
         document_id=106,
         document_title="Private decision",
@@ -120,6 +120,7 @@ def test_decision_lists_expose_counts_not_evidence_details(tmp_path: Path) -> No
     )
 
     summary = db.list_decisions()[0]
+    detail = db.get_job(job["id"], include_events=True)
 
     assert summary["applied"] == {
         "patch_fields": ["tags"],
@@ -128,3 +129,4 @@ def test_decision_lists_expose_counts_not_evidence_details(tmp_path: Path) -> No
         "removed_count": 0,
     }
     assert "sensitive excerpt" not in str(summary)
+    assert detail and detail["decision_id"] == decision_id

@@ -36,6 +36,7 @@ async def test_production_lifespan_serves_health_ui_and_assets(
         health = await client.get("/api/health")
         page = await client.get("/")
         script = await client.get("/assets/app.js")
+        styles = await client.get("/assets/styles.css")
         favicon = await client.get("/assets/favicon.svg")
 
     assert health.status_code == 200
@@ -44,16 +45,30 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert "Paperless Clerk" in page.text
     assert script.status_code == 200
     assert "renderOverview" in script.text
-    assert "DeepSeek OCR / OCR 2 profile" in script.text
+    assert "DeepSeek OCR vLLM (guarded, review-only)" in script.text
+    assert "DeepSeek OCR / OCR 2 profile" not in script.text
     assert "GLM-OCR profile" not in script.text
     assert "Prefer Clerk OCR after a trusted match" in script.text
+    assert "OCR review versions" in script.text
+    assert "Paperless had no OCR baseline" in script.text
+    assert "Both complete OCR versions" not in script.text
+    assert "Either choice removes the conflict tag" not in script.text
     assert "View diagnostic log" in script.text
     assert "decisionDiagnosticLog" in script.text
     assert "toggle-decision-log" in script.text
     assert "Container log detail" in script.text
+    assert "Enable ntfy notifications" in script.text
+    assert "View decision" in script.text
+    assert "progress-track indeterminate" in script.text
+    assert "Every run has a durable paper trail" not in script.text
+    assert "Classification you can account for" not in script.text
+    assert "Nothing fails silently" not in script.text
+    assert "Private by design" not in page.text
     assert '.replace(/\\bOcr\\b/g, "OCR")' in script.text
     assert favicon.status_code == 200
     assert favicon.headers["content-type"].startswith("image/svg+xml")
+    assert styles.status_code == 200
+    assert ".grid > .panel + .panel" in styles.text
     assert (tmp_path / "clerk.db").exists()
 
 
@@ -79,6 +94,9 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     assert "openai_base_url" in settings.json()
     assert "openai_api_key" not in settings.json()
     assert "openai_api_key_configured" in settings.json()
+    assert "ntfy_token" not in settings.json()
+    assert "ntfy_token_configured" in settings.json()
+    assert settings.json()["notifications_enabled"] is False
     assert settings.json()["ocr_profile"] == "generic"
     assert settings.json()["prefer_clerk_ocr"] is True
     assert settings.json()["log_level"] == "INFO"

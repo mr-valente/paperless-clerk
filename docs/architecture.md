@@ -39,6 +39,7 @@ Durable worker pool
     +---- PDF page renderer (PyMuPDF, temporary files)
     +---- OCR client (OpenAI-compatible chat completions with images)
     +---- Metadata client (OpenAI-compatible structured chat completions)
+    +---- ntfy client (terminal failure and intervention alerts)
 ```
 
 There is no Redis or external task service. SQLite uses WAL mode, short
@@ -61,17 +62,21 @@ crashed worker can resume work after restart.
 7. Re-fetch the Paperless document before publishing or comparing. If Paperless
    changed during inference, recheck the source hash; a changed source retries
    from its new pages, while a user-corrected OCR becomes the current comparison
-   input. If there is still no meaningful content, Clerk patches the assembled
-   content. Otherwise, a linear-time comparison combines token multiset overlap,
-   vocabulary overlap, ordered shingles, length agreement, and numeric-token
-   agreement.
+   input. If there is still no meaningful content, Clerk patches ordinary
+   assembled OCR. Output from a profile with a required content-changing guard
+   is held for review instead. Otherwise, a linear-time comparison combines
+   token multiset overlap, vocabulary overlap, ordered shingles, length
+   agreement, and numeric-token agreement.
 8. Similar OCR selects Clerk or the existing Paperless content according to the
-   configured source preference; Clerk is the default. Divergent OCR creates a
+   configured source preference. A guarded profile always retains existing
+   Paperless OCR. Divergent or unverified guarded OCR creates a
    durable conflict containing both versions and comparison evidence, adds the
    `ocr-conflict` tag, and stops before metadata classification.
-9. Resolving a conflict either keeps the Paperless text or replaces it with the
-   complete Clerk text, removes Clerk's conflict tag, and enqueues metadata-only
-   processing.
+9. Conflict resolution re-fetches the live Paperless document. Keeping
+   Paperless requires meaningful current OCR. Choosing Clerk is rejected if
+   Paperless OCR changed after the review was created, so a later human edit is
+   never overwritten. Only a successful resolution removes Clerk's conflict
+   tag and enqueues metadata-only processing.
 
 Reclaimed jobs reuse successful page rows from the same run. Paperless writes
 occur only after all required model work and validation has succeeded.
@@ -129,8 +134,12 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 - Stale worker leases are reclaimed on startup and during polling.
 - An active-job uniqueness constraint prevents duplicate manual/poller jobs.
 - OCR conflict resolutions use an atomic claim, preventing opposing concurrent
-  choices from both modifying Paperless.
+  choices from both modifying Paperless. They also validate the live OCR before
+  writing, so an empty keep choice or stale Clerk replacement leaves the review
+  open.
 - A pathological document occupies one worker only; other workers continue.
+- ntfy delivery is outside the job transaction. Failures are logged and added
+  to the job timeline without changing the document-processing result.
 - Page text and conflicts are private API details and never appear in list or
   log payloads.
 - Container logs expose lifecycle, counts, and concise validation errors. A

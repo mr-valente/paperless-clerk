@@ -86,6 +86,21 @@ class DivergentOCRModel:
         return "Northwind provided an unrelated shipping notice for a different household delivery."
 
 
+FOOTER_BODY = (
+    "Charles Schwab updated your contact information and asks you to review the "
+    "account details online. Thank you for investing with Schwab. "
+) * 8
+FOOTER_TEXT = (
+    "Brokerage products are not FDIC insured and may lose value. "
+    "Deposit products are offered by Charles Schwab Bank Member FDIC."
+)
+
+
+class FooterOmittingOCRModel:
+    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+        return FOOTER_BODY
+
+
 class OCRCorrectedDuringRunPaperless:
     def __init__(self):
         self.patches: list[dict] = []
@@ -142,6 +157,18 @@ class OCRPreferencePaperless:
     async def ensure_tag(self, name: str) -> dict:
         assert name == "ocr-conflict"
         return {"id": 99, "name": name}
+
+
+class OCRFooterPaperless(OCRPreferencePaperless):
+    def __init__(self):
+        super().__init__()
+        self.document["content"] = FOOTER_BODY + FOOTER_TEXT
+
+
+class EmptyOCRPaperless(OCRPreferencePaperless):
+    def __init__(self):
+        super().__init__()
+        self.document["content"] = ""
 
 
 class WatchTagPaperless:
@@ -375,6 +402,145 @@ async def test_trusted_ocr_match_uses_configured_source_preference(
     comparison = next(event for event in events if event["event_type"] == "ocr_compared")
     assert comparison["data"]["selected_source"] == expected_source
     assert ("ocr_preference_applied" in {event["event_type"] for event in events}) is prefer_clerk
+
+
+@pytest.mark.asyncio
+async def test_guarded_deepseek_match_retains_existing_paperless_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = OCRPreferencePaperless()
+    original = paperless.document["content"]
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert text == original
+    assert updated["content"] == original
+    assert paperless.patches == []
+    events = db.get_job(job["id"], include_events=True)["events"]
+    comparison = next(event for event in events if event["event_type"] == "ocr_compared")
+    assert comparison["data"]["selected_source"] == "paperless"
+    assert "ocr_guarded_retained_paperless" in {
+        event["event_type"] for event in events
+    }
+
+
+@pytest.mark.asyncio
+async def test_guarded_deepseek_without_baseline_requires_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = EmptyOCRPaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        MatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "needs_review"
+    assert outcome.phase == "ocr_conflict"
+    assert "no existing Paperless baseline" in outcome.message
+    assert text == ""
+    assert updated["content"] == ""
+    assert paperless.patches == [{"tags": [99]}]
+    conflicts = db.list_conflicts()
+    assert len(conflicts) == 1
+    conflict = db.get_conflict(conflicts[0]["id"])
+    assert conflict is not None
+    assert conflict["existing_text"] == ""
+    assert "Acme issued this detailed monthly statement" in conflict["generated_text"]
+    assert conflict["metrics"]["guarded_review"] is True
+    events = db.get_job(job["id"], include_events=True)["events"]
+    assert "ocr_guarded_review" in {event["event_type"] for event in events}
+
+
+@pytest.mark.asyncio
+async def test_ordinary_ocr_without_baseline_still_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = EmptyOCRPaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(ocr_profile="generic")
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        MatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert text == updated["content"]
+    assert "Acme issued this detailed monthly statement" in text
+    assert paperless.patches == [{"content": text}]
+    assert db.list_conflicts() == []
+
+
+@pytest.mark.asyncio
+async def test_less_complete_clerk_ocr_never_overwrites_an_existing_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = OCRFooterPaperless()
+    original = paperless.document["content"]
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        FooterOmittingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert text == original
+    assert updated["content"] == original
+    assert paperless.patches == []
+    events = db.get_job(job["id"], include_events=True)["events"]
+    comparison = next(event for event in events if event["event_type"] == "ocr_compared")
+    assert comparison["data"]["selected_source"] == "paperless"
+    assert comparison["data"]["coverage_safeguard"] is True
+    assert any(event["event_type"] == "ocr_coverage_safeguard" for event in events)
+    configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
+    assert configuration["data"]["model"] == "qwen2.5vl:7b"
+    assert configuration["data"]["profile"] == "deepseek_ocr"
+    assert configuration["data"]["image_format"] == "png"
+    assert configuration["data"]["vllm_xargs"] == {
+        "ngram_size": 20,
+        "window_size": 90,
+        "whitelist_token_ids": [128821, 128822],
+    }
+    assert configuration["data"]["publication_policy"] == "existing_paperless_or_review"
+    assert (
+        configuration["data"]["completion_policy"]
+        == "discard_token_limited_or_repetition_stopped_output"
+    )
 
 
 @pytest.mark.asyncio

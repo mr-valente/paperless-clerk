@@ -21,9 +21,11 @@ model can transcribe pages while a smaller text model handles classification.
 - Compares Clerk OCR with existing Paperless OCR using token, vocabulary,
   ordered-shingle, length, and numeric agreement.
 - Selects either Clerk or the existing Paperless OCR after a trusted match,
-  according to the configured preference. Clerk OCR is preferred by default.
-- Adds an `ocr-conflict` Paperless tag and retains both complete readings when
-  they disagree.
+  according to the configured preference. Profiles that require
+  content-changing decoding guards are review-only and never replace Paperless
+  OCR automatically.
+- Adds an `ocr-conflict` Paperless tag and retains the available readings when
+  they disagree or guarded OCR has no Paperless baseline.
 - Lets the user resolve a conflict side by side and resumes metadata processing
   only after that decision.
 - Classifies correspondents, document types, tags, titles, intrinsic dates, and
@@ -84,7 +86,9 @@ For a manual or discovered document:
    images while local OCR calls run.
 3. Completed pages are committed immediately to SQLite. A process restart or
    retry skips those pages if the source has not changed.
-4. If Paperless has no meaningful content, Clerk patches the assembled text.
+4. If Paperless has no meaningful content, Clerk patches ordinary OCR output.
+   A guarded DeepSeek result instead creates a review item because Paperless has
+   no existing OCR baseline to retain.
 5. If content exists, Clerk compares the two complete readings. A high score
    selects the configured preferred source (Clerk by default); a low score
    creates an intervention without replacing either reading automatically.
@@ -148,33 +152,121 @@ Schema output for metadata. If a local server rejects `json_schema`, Clerk
 falls back to `json_object`; the result is still validated locally before any
 Paperless write.
 
-### DeepSeek OCR request profile
+### OCR request profiles
 
 Most general vision-language models accept Clerk's normal system instruction
 and detailed transcription prompt. Specialist OCR models often do not: their
-training expects one image and one exact, short task command. Clerk provides a
-single specialist checkbox directly below the OCR model name in **Settings →
-Vision OCR**:
+training expects one image and one exact, short task command. Choose the serving
+stack under **Settings → Vision OCR**:
 
-- **Unchecked (generic)** keeps the normal request for Qwen and other
+- **Generic vision model** keeps the normal request for Qwen and other
   instruction-following vision models.
-- **DeepSeek OCR / OCR 2 profile** sends one image-first user message containing
-  only `Free OCR.`. It supports both DeepSeek-OCR generations and strips any
-  accidental DeepSeek reference/coordinate scaffolding before comparison or
-  publication. Clerk deliberately uses plain OCR rather than grounded Markdown
-  because Paperless's OCR field is the canonical readable text, not a layout
-  annotation store.
+- **DeepSeek OCR vLLM profile** targets DeepSeek-OCR and DeepSeek-OCR-2 on
+  vLLM. It renders pages losslessly, then sends one image-first user message
+  containing DeepSeek's document task,
+  `<|grounding|>Convert the document to markdown.`, along with
+  `skip_special_tokens: false` and the model author's 20-token/90-token-window
+  n-gram guard.
+  Clerk removes DeepSeek's paired layout-class and coordinate annotations while
+  retaining the recognized Markdown text for comparison and review. Because
+  the required guard changes decoding, this profile never publishes OCR
+  automatically: existing Paperless OCR remains canonical, or a
+  review item is created when no baseline exists.
+- **DeepSeek OCR-2 GGUF via llama.cpp** reproduces Clerk's earlier request for
+  `sabafallah/DeepSeek-OCR-2-GGUF`: JPEG at the configured render resolution,
+  one image-first user message containing `Free OCR.`, temperature 0, and
+  `top_k: 1`. It deliberately sends no vLLM-only fields, but remains an
+  experimental A/B path rather than a fidelity guarantee.
 
 Selecting the profile changes the OCR processing fingerprint, so a retried job
 will discard page results produced with a different request contract. The
 **Test OCR model** action renders and
-sends a real image containing known text; it therefore verifies the vision
-projector and selected profile instead of merely testing text chat.
+sends a portrait document containing known header, body, and footer text; it
+therefore verifies the vision projector and selected production profile instead
+of merely testing text chat. The check succeeds only when markers from all
+three regions are present, so reading the header while dropping the footer is a
+failure.
 
-This profile adapts Clerk's API request, but it cannot compensate for a
-missing or mismatched multimodal projector or an older inference server that
-does not support the model architecture. DeepSeek-OCR-2 in particular requires
-a recent llama.cpp build with its matching OCR-2 `mmproj` GGUF.
+#### vLLM serving recipe
+
+Use a recent upstream vLLM release with native `DeepseekOCR2ForCausalLM`
+support:
+
+```sh
+vllm serve deepseek-ai/DeepSeek-OCR-2 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --max-model-len 8192 \
+  --logits_processors vllm.model_executor.models.deepseek_ocr:NGramPerReqLogitsProcessor \
+  --no-enable-prefix-caching \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image": 1}'
+```
+
+Then configure the endpoint or model router used by Clerk:
+
+```env
+CLERK_OPENAI_BASE_URL=http://your-vllm-host:8000/v1
+CLERK_OCR_MODEL=deepseek-ai/DeepSeek-OCR-2
+CLERK_OCR_PROFILE=deepseek_ocr
+```
+
+Current vLLM releases provide a built-in DeepSeek-OCR fallback chat template,
+which formats Clerk's image-first message as the model's native
+`<image>`-plus-document-task prompt. Clerk does not send a request-level
+`chat_template`, so neither `--chat-template` nor
+`--trust-request-chat-template` is needed. Leave request-template trust disabled.
+
+DeepSeek-OCR-2 does not reliably terminate under unguarded greedy decoding.
+Loading the vLLM processor is not enough: Clerk must also send its per-request
+`vllm_xargs`. Clerk uses DeepSeek's single-image `ngram_size: 20`,
+`window_size: 90`, and table-token whitelist. This is more aggressive than
+vLLM's generic online example because that example's `30/90` setting was not
+enough for the observed financial-letter loop. It is still not a lossless
+setting: the processor forbids a previously seen continuation and can therefore
+alter a legitimate exact repeated span. Clerk exposes that limitation instead
+of hiding it—DeepSeek output is advisory, token-limited responses are rejected,
+and only a human can promote guarded output when no existing Paperless OCR exists.
+
+Clerk records the effective OCR model, profile, prompt, render settings, and
+completion policy in each job's event history. This makes an older successful
+configuration recoverable without relying on container logs or memory.
+
+#### Completeness limits
+
+DeepSeek-OCR-2 internally resizes a full page into a fixed global view and a
+bounded set of local crops. Raising Clerk's DPI cannot add model-side visual
+tokens once those views are populated. Full-page footer omissions can therefore
+be model failures even when the source render is sharp. When Paperless already
+has meaningful OCR, Clerk now measures directional coverage as well as overall
+similarity and retains Paperless's text if the new result omits material
+existing words, especially a trailing block. The job records the coverage and
+suffix counts. This safeguard prevents data loss; it cannot recover omitted
+text when no prior OCR exists.
+
+For documents where independent OCR completeness is mandatory, use a
+layout-aware pipeline that detects regions, crops each region, recognizes them
+separately, and merges reading order. The GLM-OCR SDK provides that architecture
+and can call an external OpenAI-compatible GLM model while its layout detector
+runs on CPU. Its stock configuration intentionally discards headers, footers,
+footnotes, page numbers, and several marginal-text classes, so an archival
+configuration must map those labels to the text task rather than accepting the
+defaults. This requires a separate SDK service and real hardware validation; a
+single full-page chat request is not an equivalent substitute.
+
+The original DeepSeek repository's pinned vLLM wheel and example scripts drive
+an in-process `AsyncLLMEngine`; they are not an OpenAI-compatible HTTP serving
+recipe. Clerk should point at `vllm serve` (or a compatible model router), not
+at those scripts. A bare vLLM process normally serves one base model. Because
+Clerk intentionally uses one shared OpenAI-compatible URL for OCR and metadata,
+that URL must also route the configured metadata model if it is hosted by a
+different vLLM worker.
+
+The profile cannot compensate for an older vLLM release that does not support
+the model architecture. Keep Clerk's per-page output limit below the server's
+available context budget. A token-limit error on a short page is evidence of a
+generation loop, not a reason to raise the limit; a larger limit only makes that
+failure slower.
 
 Recommended endpoint characteristics:
 
@@ -206,8 +298,8 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_OPENAI_BASE_URL` | `http://host.docker.internal:11434/v1` | Shared local endpoint for OCR and metadata models |
 | `CLERK_OPENAI_API_KEY` | empty | Optional bearer token shared by both model clients |
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
-| `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic` or `deepseek_ocr` (covers DeepSeek OCR and OCR 2) |
-| `CLERK_PREFER_CLERK_OCR` | `true` | After a trusted OCR match, publish Clerk OCR instead of retaining existing Paperless OCR |
+| `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic`, vLLM-oriented `deepseek_ocr`, or `deepseek_ocr_llamacpp` for the earlier GGUF stack |
+| `CLERK_PREFER_CLERK_OCR` | `true` | After a trusted OCR match, publish ordinary Clerk OCR; guarded DeepSeek vLLM output is always review-only |
 | `CLERK_OCR_CONTEXT_TOKENS` | `8192` | Declared OCR context limit |
 | `CLERK_OCR_MAX_OUTPUT_TOKENS` | `4096` | Per-page OCR output cap |
 | `CLERK_METADATA_MODEL` | `qwen2.5:14b` | Metadata model name |
@@ -221,7 +313,7 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_METADATA_CONCURRENCY` | `1` | Metadata map calls within one document |
 | `CLERK_RENDER_DPI` | `160` | Initial page rendering DPI |
 | `CLERK_MAX_IMAGE_PIXELS` | `16000000` | Per-page pixel ceiling; DPI scales down to fit |
-| `CLERK_JPEG_QUALITY` | `86` | Rendered page JPEG quality |
+| `CLERK_JPEG_QUALITY` | `86` | Rendered JPEG quality for generic and llama.cpp OCR; the DeepSeek vLLM profile uses lossless PNG |
 | `CLERK_OCR_MIN_CHARS` | `24` | Minimum meaningful existing OCR size |
 | `CLERK_OCR_SIMILARITY_THRESHOLD` | `0.82` | Score required to choose either OCR source automatically |
 | `CLERK_CONFLICT_TAG` | `ocr-conflict` | Paperless review tag |
@@ -237,6 +329,10 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_AUTOMATION_INTERVAL_SECONDS` | `120` | Discovery interval |
 | `CLERK_AUTOMATION_PAGE_SIZE` | `25` | Documents inspected on each newest/backlog poll |
 | `CLERK_AUTOMATION_TAG` | empty | Optional workflow-only queue tag; blank makes all documents eligible |
+| `CLERK_NOTIFICATIONS_ENABLED` | `false` | Send ntfy alerts for terminal failures and intervention states |
+| `CLERK_NTFY_URL` | `https://ntfy.sh` | ntfy server root URL |
+| `CLERK_NTFY_TOPIC` | empty | ntfy topic; required when notifications are enabled |
+| `CLERK_NTFY_TOKEN` | empty | Optional bearer token for a protected ntfy topic |
 | `CLERK_DATA_DIR` | `./data` (`/app/data` in image) | SQLite data directory |
 | `CLERK_HOST` / `CLERK_PORT` | `0.0.0.0` / `8080` | HTTP listener |
 | `CLERK_LOG_LEVEL` | `INFO` | Application log level |
@@ -248,6 +344,28 @@ Appearance preferences—system/light/dark theme, comfortable/compact density,
 and system/full/reduced motion—are stored in Clerk through the UI and cached in
 the browser to avoid a theme flash during startup.
 
+### ntfy notifications
+
+Enable notifications in **Settings → Notifications**, then enter a topic and
+optionally an access token. The **Send test** button publishes a normal-priority
+test message. Operational alerts use high priority and are limited to events
+that need attention:
+
+- a job reaches its final failed state after bounded retries;
+- an OCR conflict or another review-required state is created;
+- automatic Paperless discovery fails (one alert per continuous outage).
+
+Successful jobs and intermediate retry attempts do not send notifications.
+ntfy delivery is auxiliary: a timeout, authentication error, or unavailable
+ntfy server is written to the container log and the job event history without
+changing the processing outcome.
+
+Topics on the public `ntfy.sh` service should be long and difficult to guess;
+without access controls, the topic name acts as the subscription secret. A
+notification contains the Paperless document title and ID plus a bounded error
+or review message, so use a protected topic or a self-hosted ntfy server if that
+metadata is sensitive.
+
 Clerk normalizes existing string, long-text, boolean, integer, float, monetary,
 date, URL, and select custom fields. It deliberately omits document-link values
 because the model is not given an authoritative bounded set of document IDs;
@@ -256,14 +374,18 @@ default and supports only safely typed definitions.
 
 ## Conflict and correction workflow
 
-An open OCR conflict retains both full text versions and comparison metrics in
-Clerk. The Paperless document receives the conflict tag but its OCR is not
-changed. In **Intervention**:
+An open OCR conflict retains the OCR snapshot available when the review was
+created, Clerk's generated text, and comparison metrics. The Paperless document
+receives the conflict tag but its OCR is not changed. Resolution always
+re-fetches the live document. In **Intervention**:
 
-- **Keep Paperless OCR** closes the conflict without changing `content`.
-- **Use Clerk OCR** replaces `content` with the complete assembled page text.
+- **Keep Paperless OCR** requires meaningful current Paperless OCR and closes
+  the conflict without changing `content`.
+- **Use Clerk OCR** replaces `content` with the assembled page text only when
+  Paperless OCR has not changed since the review was created.
 
-Both actions remove Clerk's conflict tag and enqueue metadata-only analysis.
+Only a successful action removes Clerk's conflict tag and enqueues metadata-only
+analysis. An empty keep choice or stale Clerk choice leaves the review open.
 Recent metadata decisions show the exact patch, canonical entities reused, new
 entities created, near-duplicates normalized, and candidates withheld. The
 document opens directly in Paperless for correction, and metadata can be rerun
@@ -282,6 +404,8 @@ deliberately excludes full OCR text and model request prompts.
   resistant without another service.
 - Retry counts, due times, errors, page status, and decisions survive restarts.
 - Retryable HTTP failures use bounded exponential backoff.
+- ntfy alerts are attempted only for actionable or terminal states; delivery
+  failures are observable but never fail or retry an otherwise completed job.
 - Verbose model rationale fields are normalized to their schema limit, so a
   valid metadata or tag choice is not discarded only because its explanation
   ran long.
@@ -336,7 +460,8 @@ Interactive OpenAPI documentation is served at `/api/docs`. The UI uses:
 - `/api/conflicts` for comparison detail and resolution;
 - `/api/decisions` for metadata rationale;
 - `/api/interventions` for the review desk;
-- `/api/settings` and `/api/settings/test/{target}` for configuration;
+- `/api/settings` and `/api/settings/test/{target}` for configuration and
+  Paperless, model, or ntfy test requests;
 - `/api/health` for container health checks.
 
 ## License
