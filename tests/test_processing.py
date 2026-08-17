@@ -70,19 +70,19 @@ class SinglePageRenderer:
 
 
 class MatchingOCRModel:
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         return (
             "Acme issued this detailed monthly statement with account totals and payment history."
         )
 
 
 class NearMatchingOCRModel:
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         return "Acme issued this detailed monthly statement with account totals and payment history"
 
 
 class DivergentOCRModel:
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         return "Northwind provided an unrelated shipping notice for a different household delivery."
 
 
@@ -97,7 +97,7 @@ FOOTER_TEXT = (
 
 
 class FooterOmittingOCRModel:
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         return FOOTER_BODY
 
 
@@ -406,7 +406,7 @@ async def test_trusted_ocr_match_uses_configured_source_preference(
 
 @pytest.mark.asyncio
 async def test_deepseek_match_can_publish_preferred_clerk_ocr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vllm_profiles: None
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
@@ -440,7 +440,7 @@ async def test_deepseek_match_can_publish_preferred_clerk_ocr(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["deepseek_ocr", "glm_ocr"])
 async def test_specialist_ocr_without_baseline_publishes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vllm_profiles: None, profile: str
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
@@ -464,13 +464,11 @@ async def test_specialist_ocr_without_baseline_publishes(
     assert db.list_conflicts() == []
     events = db.get_job(job["id"], include_events=True)["events"]
     configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
-    assert configuration["data"]["image_format"] == "jpeg"
+    assert configuration["data"]["profile"] == profile
     assert configuration["data"]["prompt"] == (
         "Free OCR." if profile == "deepseek_ocr" else "Text Recognition:"
     )
-    assert configuration["data"]["decoding"] == (
-        {"temperature": 0, "top_k": 1} if profile == "deepseek_ocr" else {"temperature": 0}
-    )
+    assert ("vllm_xargs" in configuration["data"]["extra_body"]) is (profile == "deepseek_ocr")
 
 
 @pytest.mark.asyncio
@@ -500,8 +498,8 @@ async def test_ordinary_ocr_without_baseline_still_publishes(
 
 
 @pytest.mark.asyncio
-async def test_less_complete_clerk_ocr_never_overwrites_an_existing_footer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_shorter_clerk_ocr_never_overwrites_an_existing_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vllm_profiles: None
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
@@ -526,16 +524,12 @@ async def test_less_complete_clerk_ocr_never_overwrites_an_existing_footer(
     events = db.get_job(job["id"], include_events=True)["events"]
     comparison = next(event for event in events if event["event_type"] == "ocr_compared")
     assert comparison["data"]["selected_source"] == "paperless"
-    assert comparison["data"]["coverage_safeguard"] is True
-    assert any(event["event_type"] == "ocr_coverage_safeguard" for event in events)
+    assert comparison["data"]["generated_tokens"] < comparison["data"]["existing_tokens"]
     configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
     assert configuration["data"]["model"] == "qwen2.5vl:7b"
     assert configuration["data"]["profile"] == "deepseek_ocr"
-    assert configuration["data"]["image_format"] == "jpeg"
     assert configuration["data"]["prompt"] == "Free OCR."
-    assert configuration["data"]["decoding"] == {"temperature": 0, "top_k": 1}
-    assert "vllm_xargs" not in configuration["data"]
-    assert "publication_policy" not in configuration["data"]
+    assert configuration["data"]["max_output_tokens"] == 4096
 
 
 @pytest.mark.asyncio

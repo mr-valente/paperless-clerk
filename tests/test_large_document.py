@@ -28,7 +28,7 @@ class BoundedFakeModel:
         self.maximum_active = 0
         self.called: list[int] = []
 
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         self.active += 1
         self.maximum_active = max(self.maximum_active, self.active)
         self.called.append(page_number)
@@ -38,10 +38,10 @@ class BoundedFakeModel:
 
 
 class OnePageFailureModel(BoundedFakeModel):
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
         if page_number == 3:
             raise ModelError("vision endpoint rejected this page", retryable=False)
-        return await super().ocr_page(image, page_number=page_number, prompt=prompt)
+        return await super().ocr_page(image, page_number=page_number)
 
 
 @pytest.mark.asyncio

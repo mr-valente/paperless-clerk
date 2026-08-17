@@ -45,9 +45,7 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert "Paperless Clerk" in page.text
     assert script.status_code == 200
     assert "renderOverview" in script.text
-    assert "DeepSeek OCR-2 via vLLM" in script.text
-    assert "DeepSeek OCR / OCR 2 profile" not in script.text
-    assert "GLM-OCR via vLLM" in script.text
+    assert "ocr_profile_choices" in script.text
     assert "Prefer Clerk OCR after a trusted match" in script.text
     assert "OCR review versions" in script.text
     assert "Paperless had no OCR baseline" in script.text
@@ -98,6 +96,11 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     assert "ntfy_token_configured" in settings.json()
     assert settings.json()["notifications_enabled"] is False
     assert settings.json()["ocr_profile"] == "generic"
+    # The vLLM profiles are held back, so the UI offers only the working two.
+    assert [choice["key"] for choice in settings.json()["ocr_profile_choices"]] == [
+        "generic",
+        "deepseek_ocr_llamacpp",
+    ]
     assert settings.json()["prefer_clerk_ocr"] is True
     assert settings.json()["log_level"] == "INFO"
     assert "ocr_base_url" not in settings.json()

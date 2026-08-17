@@ -5,6 +5,7 @@ import pytest
 
 from paperless_clerk.config import Settings, SettingsManager, load_persisted_settings
 from paperless_clerk.db import Database
+from paperless_clerk.ocr_profiles import VLLM_FLAG, ocr_profile
 
 
 def test_omitted_secret_is_preserved_and_explicit_blank_clears_it(tmp_path: Path) -> None:
@@ -38,6 +39,41 @@ def test_ocr_profile_defaults_to_generic_and_accepts_specialists() -> None:
     assert Settings().prefer_clerk_ocr is True
     with pytest.raises(ValueError, match="ocr_profile"):
         Settings(ocr_profile="some-other-model")
+
+
+def test_held_back_vllm_profiles_are_offered_only_behind_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    offered = [choice["key"] for choice in Settings().public_dict()["ocr_profile_choices"]]
+    assert offered == ["generic", "deepseek_ocr_llamacpp"]
+
+    monkeypatch.setenv(VLLM_FLAG, "true")
+
+    offered = [choice["key"] for choice in Settings().public_dict()["ocr_profile_choices"]]
+    assert offered == ["generic", "deepseek_ocr", "deepseek_ocr_llamacpp", "glm_ocr"]
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
+def test_a_held_back_profile_resolves_to_generic_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # A database that still names a vLLM profile has to keep loading, so the
+    # request contract degrades rather than the container refusing to start.
+    monkeypatch.setenv(VLLM_FLAG, value)
+
+    assert Settings(ocr_profile="glm_ocr").ocr_profile == "glm_ocr"
+    assert ocr_profile("glm_ocr").key == "generic"
+    assert ocr_profile("deepseek_ocr").key == "generic"
+    # Neither of the working paths is gated.
+    assert ocr_profile("deepseek_ocr_llamacpp").key == "deepseek_ocr_llamacpp"
+    assert ocr_profile("generic").key == "generic"
+
+
+def test_the_flag_restores_the_vllm_request_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(VLLM_FLAG, "1")
+
+    assert ocr_profile("glm_ocr").key == "glm_ocr"
+    assert "vllm_xargs" in ocr_profile("deepseek_ocr").extra_body
 
 
 def test_explicit_environment_value_overrides_persisted_ui_value(

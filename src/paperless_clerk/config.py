@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from paperless_clerk.ocr_profiles import PROFILE_KEYS, available_profiles
+
 
 class Settings(BaseModel):
     """Runtime settings.
@@ -24,12 +26,15 @@ class Settings(BaseModel):
     openai_base_url: str = "http://host.docker.internal:11434/v1"
     openai_api_key: SecretStr = SecretStr("")
     ocr_model: str = "qwen2.5vl:7b"
-    ocr_profile: Literal["generic", "deepseek_ocr", "deepseek_ocr_llamacpp", "glm_ocr"] = "generic"
+    ocr_profile: str = "generic"
     prefer_clerk_ocr: bool = True
-    ocr_context_tokens: int = Field(default=8192, ge=1024, le=1_000_000)
+    # No OCR context setting: one page image plus a short command is the whole
+    # request, so the server's own context is the only limit that matters and
+    # it already clamps an oversized output request.
     ocr_max_output_tokens: int = Field(default=4096, ge=256, le=131_072)
 
     metadata_model: str = "qwen2.5:14b"
+    # Unlike OCR, this one is load-bearing: it sizes the chunk budget below.
     metadata_context_tokens: int = Field(default=16384, ge=2048, le=1_000_000)
     metadata_max_output_tokens: int = Field(default=4096, ge=256, le=131_072)
 
@@ -82,6 +87,13 @@ class Settings(BaseModel):
             raise ValueError("must start with http:// or https://")
         return value
 
+    @field_validator("ocr_profile")
+    @classmethod
+    def known_ocr_profile(cls, value: str) -> str:
+        if value not in PROFILE_KEYS:
+            raise ValueError(f"must be one of: {', '.join(PROFILE_KEYS)}")
+        return value
+
     @field_validator("conflict_tag", "automation_tag")
     @classmethod
     def normalize_tag(cls, value: str) -> str:
@@ -106,15 +118,9 @@ class Settings(BaseModel):
             raise ValueError("automation watch tag must differ from the OCR conflict tag")
         if self.notifications_enabled and not self.ntfy_topic:
             raise ValueError("an ntfy topic is required when notifications are enabled")
-        if self.ocr_max_output_tokens >= self.ocr_context_tokens:
-            raise ValueError("OCR maximum output tokens must be smaller than its context limit")
         if self.metadata_max_output_tokens >= self.metadata_context_tokens:
             raise ValueError(
                 "metadata maximum output tokens must be smaller than its context limit"
-            )
-        if self.ocr_context_tokens - self.ocr_max_output_tokens < 1_024:
-            raise ValueError(
-                "OCR context must reserve at least 1024 tokens for the prompt and image"
             )
         if self.metadata_context_tokens - self.metadata_max_output_tokens < 2_048:
             raise ValueError("metadata context must reserve at least 2048 input tokens")
@@ -147,6 +153,11 @@ class Settings(BaseModel):
                 "paperless_token_configured": bool(self.paperless_token.get_secret_value()),
                 "openai_api_key_configured": bool(self.openai_api_key.get_secret_value()),
                 "ntfy_token_configured": bool(self.ntfy_token.get_secret_value()),
+                # Only the profiles on offer. A held-back one stays valid so a
+                # database that names it still loads; the UI just stops showing it.
+                "ocr_profile_choices": [
+                    {"key": profile.key, "label": profile.label} for profile in available_profiles()
+                ],
                 # Names only: this lets the UI explain why a container-managed
                 # value is read-only without exposing any environment secrets.
                 "environment_overrides": sorted(environment_values()),
@@ -164,7 +175,6 @@ ENVIRONMENT_FIELDS = {
     "CLERK_OCR_MODEL": "ocr_model",
     "CLERK_OCR_PROFILE": "ocr_profile",
     "CLERK_PREFER_CLERK_OCR": "prefer_clerk_ocr",
-    "CLERK_OCR_CONTEXT_TOKENS": "ocr_context_tokens",
     "CLERK_OCR_MAX_OUTPUT_TOKENS": "ocr_max_output_tokens",
     "CLERK_METADATA_MODEL": "metadata_model",
     "CLERK_METADATA_CONTEXT_TOKENS": "metadata_context_tokens",

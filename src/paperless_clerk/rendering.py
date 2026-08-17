@@ -10,18 +10,14 @@ class RenderError(RuntimeError):
     pass
 
 
-def render_ocr_test_image(image_format: str = "jpeg") -> bytes:
+def render_ocr_test_image() -> bytes:
     """Render a page-like document so an OCR health check exercises the projector."""
-
-    if image_format not in {"jpeg", "png"}:
-        raise ValueError("image_format must be jpeg or png")
 
     document = pymupdf.open()
     try:
-        # DeepSeek's document prompt is trained on page layouts. A previous
-        # wide, single-line banner could be classified as a layout region but
-        # yield no Markdown transcription after the coordinates were removed.
-        # Keep this fixture close to the pages production actually sends.
+        # Specialist OCR models are trained on page layouts, so keep this
+        # fixture close to the pages production actually sends rather than
+        # using a short banner of text.
         page = document.new_page(width=612, height=792)
         page.insert_text((54, 78), "PAPERLESS CLERK", fontsize=24, fontname="hebo")
         page.insert_text((54, 112), "OCR CONNECTION TEST", fontsize=18, fontname="helv")
@@ -41,8 +37,6 @@ def render_ocr_test_image(image_format: str = "jpeg") -> bytes:
         )
         page.insert_text((54, 735), "END OF CLERK OCR TEST", fontsize=11, fontname="helv")
         pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False, colorspace=pymupdf.csRGB)
-        if image_format == "png":
-            return pixmap.tobytes("png")
         return pixmap.tobytes("jpeg", jpg_quality=92)
     finally:
         document.close()
@@ -58,15 +52,11 @@ class DocumentRenderer:
         dpi: int,
         max_pixels: int,
         jpeg_quality: int,
-        image_format: str = "jpeg",
     ):
         self.path = path
         self.dpi = dpi
         self.max_pixels = max_pixels
         self.jpeg_quality = jpeg_quality
-        if image_format not in {"jpeg", "png"}:
-            raise ValueError("image_format must be jpeg or png")
-        self.image_format = image_format
         try:
             self.document = pymupdf.open(path)
         except Exception as exc:  # pragma: no cover - library-specific exception tree
@@ -89,8 +79,6 @@ class DocumentRenderer:
             pixmap = page.get_pixmap(
                 matrix=pymupdf.Matrix(scale, scale), alpha=False, colorspace=pymupdf.csRGB
             )
-            if self.image_format == "png":
-                return pixmap.tobytes("png")
             return pixmap.tobytes("jpeg", jpg_quality=self.jpeg_quality)
         except Exception as exc:  # pragma: no cover - library-specific exception tree
             raise RenderError(f"Unable to render page {page_index + 1}: {exc}") from exc

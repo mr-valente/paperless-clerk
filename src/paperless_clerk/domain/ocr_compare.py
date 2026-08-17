@@ -52,10 +52,6 @@ class OCRComparison:
     ordered_shingle_overlap: float
     length_agreement: float
     numeric_overlap: float
-    existing_coverage: float
-    generated_coverage: float
-    existing_missing_tokens: int
-    unmatched_existing_suffix_tokens: int
     existing_tokens: int
     generated_tokens: int
     mismatch_snippets: list[dict[str, str]]
@@ -70,28 +66,10 @@ def compare_ocr(existing: str, generated: str, threshold: float = 0.82) -> OCRCo
     left = normalized_tokens(existing)
     right = normalized_tokens(generated)
 
-    left_count = Counter(left)
-    right_count = Counter(right)
-    shared_token_count = sum((left_count & right_count).values())
-    token_overlap = _dice_counter(left_count, right_count)
+    token_overlap = _dice_counter(Counter(left), Counter(right))
     vocabulary_overlap = _jaccard(set(left), set(right))
     ordered_overlap = _dice_counter(_shingles(left), _shingles(right))
     length_agreement = min(len(left), len(right)) / max(1, max(len(left), len(right)))
-    existing_coverage = shared_token_count / len(left) if left else 1.0
-    generated_coverage = shared_token_count / len(right) if right else 1.0
-    existing_missing_tokens = max(0, len(left) - shared_token_count)
-
-    # Compare only the tail to keep this diagnostic bounded on very large
-    # documents. Unlike a token count, it makes a missing footer directly
-    # visible in retained job metrics.
-    left_tail = left[-5000:]
-    right_tail = right[-5000:]
-    tail_matcher = difflib.SequenceMatcher(a=left_tail, b=right_tail, autojunk=False)
-    last_existing_match_end = max(
-        (block.a + block.size for block in tail_matcher.get_matching_blocks() if block.size),
-        default=0,
-    )
-    unmatched_existing_suffix_tokens = len(left_tail) - last_existing_match_end
 
     def numeric_terms(tokens: list[str]) -> Counter[str]:
         # OCR punctuation normalization splits 1250.00 into "1250", "00".
@@ -131,10 +109,6 @@ def compare_ocr(existing: str, generated: str, threshold: float = 0.82) -> OCRCo
         ordered_shingle_overlap=round(ordered_overlap, 4),
         length_agreement=round(length_agreement, 4),
         numeric_overlap=round(numeric_overlap, 4),
-        existing_coverage=round(existing_coverage, 4),
-        generated_coverage=round(generated_coverage, 4),
-        existing_missing_tokens=existing_missing_tokens,
-        unmatched_existing_suffix_tokens=unmatched_existing_suffix_tokens,
         existing_tokens=len(left),
         generated_tokens=len(right),
         mismatch_snippets=_mismatch_snippets(left, right),

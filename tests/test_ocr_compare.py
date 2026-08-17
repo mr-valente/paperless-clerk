@@ -56,7 +56,7 @@ def test_meaningful_ocr_rejects_tiny_scanner_noise() -> None:
     )
 
 
-def test_directional_metrics_expose_a_missing_footer_even_when_documents_are_similar() -> None:
+def test_token_counts_expose_a_missing_footer_even_when_documents_are_similar() -> None:
     body = (
         "Charles Schwab updated your contact information and asks you to review the "
         "account details online. Thank you for investing with Schwab. "
@@ -69,7 +69,4 @@ def test_directional_metrics_expose_a_missing_footer_even_when_documents_are_sim
     comparison = compare_ocr(body + footer, body)
 
     assert comparison.is_similar
-    assert comparison.existing_coverage < 0.98
-    assert comparison.generated_coverage == 1.0
-    assert comparison.existing_missing_tokens >= 5
-    assert comparison.unmatched_existing_suffix_tokens >= 5
+    assert comparison.generated_tokens < 0.98 * comparison.existing_tokens

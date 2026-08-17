@@ -3,16 +3,83 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from typing import Any
 
 import httpx
 
 from paperless_clerk.config import Settings
-from paperless_clerk.prompts import SPECIALIST_OCR_PROFILES, ocr_prompt_for_profile
+from paperless_clerk.ocr_profiles import ocr_profile
 from paperless_clerk.rendering import render_ocr_test_image
 
-OCR_REQUEST_CONTRACT_VERSION = 6
+_THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_CODE_FENCE = re.compile(r"^\s*```[a-z]*\s*\n?(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE)
+# DeepSeek's grounded output labels each block with a layout class and a
+# coordinate box. Both describe the page; neither is page text.
+_GROUNDING_ANNOTATION = re.compile(r"<\|(ref|det)\|>.*?<\|/\1\|>", re.DOTALL)
+# A profile that keeps special tokens visible leaves control tokens in the
+# content. DeepSeek writes some of them with full-width pipes.
+_SPECIAL_TOKEN = re.compile(r"<[|｜][^<>\n]{0,64}?[|｜]>")
+_BLANK_RUN = re.compile(r"\n(?:[ \t]*\n){2,}")
+_REFUSAL_PREFIXES = ("i cannot", "i can't", "i am unable", "i'm unable", "sorry, i")
+# A cycle has to repeat this many times before we treat it as a decoder loop
+# rather than a page that genuinely repeats a line.
+_LOOP_MIN_REPEATS = 3
+
+log = logging.getLogger(__name__)
+
+
+def clean_ocr_text(text: str) -> str:
+    """Remove response scaffolding without ever rewriting transcribed text."""
+
+    text = _THINK_BLOCK.sub("", text)
+    text = _CODE_FENCE.sub(r"\1", text)
+    text = _GROUNDING_ANNOTATION.sub("", text)
+    text = _SPECIAL_TOKEN.sub("", text)
+    return _BLANK_RUN.sub("\n\n", text).strip()
+
+
+def _drop_repeated_tail(units: list[str], max_period: int) -> list[str] | None:
+    """Find a block repeated to the very end and return the text up to one copy."""
+
+    for period in range(1, min(max_period, len(units) // _LOOP_MIN_REPEATS) + 1):
+        block = units[-period:]
+        index = len(units) - period
+        repeats = 1
+        while index >= period and units[index - period : index] == block:
+            repeats += 1
+            index -= period
+        if repeats >= _LOOP_MIN_REPEATS:
+            return units[: index + period]
+    return None
+
+
+def trim_runaway_repetition(text: str) -> str:
+    """Cut a decoder loop off the end of a truncated page.
+
+    A greedy decoder that falls into a cycle emits the same block until it hits
+    the token cap, but the transcription before the cycle is still good. Keep one
+    copy of the block and drop the rest. Only ever called on a truncated
+    response, so a page that legitimately repeats a line is never touched.
+    """
+
+    stripped = text.strip()
+    # A loop with no newline in it is one long line, so fall back to words.
+    for units, joiner, max_period in (
+        (stripped.splitlines(), "\n", 40),
+        (stripped.split(" "), " ", 60),
+    ):
+        trimmed = _drop_repeated_tail(units, max_period)
+        if trimmed is None:
+            continue
+        kept = joiner.join(trimmed).rstrip()
+        # Only believe it is a decoder cycle when the repetition dominates the
+        # response. A few identical table rows or repeated form labels are page
+        # content, and deleting them would lose real text.
+        if len(kept) <= 0.5 * len(stripped):
+            return kept
+    return text
 
 
 class ModelError(RuntimeError):
@@ -31,7 +98,7 @@ class OpenAICompatibleClient:
         self.api_key = settings.secret_value("openai_api_key")
         self.max_output_tokens = getattr(settings, f"{purpose}_max_output_tokens")
         self.max_retries = settings.model_max_retries
-        self.ocr_profile = settings.ocr_profile if purpose == "ocr" else "generic"
+        self.profile = ocr_profile(settings.ocr_profile if purpose == "ocr" else "generic")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -133,112 +200,101 @@ class OpenAICompatibleClient:
         return str(reason) if reason is not None else None
 
     @staticmethod
-    def _image_media_type(image: bytes) -> str:
-        return "image/png" if image.startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
-
-    async def ocr_page(self, image: bytes, *, page_number: int, prompt: str) -> str:
-        encoded = base64.b64encode(image).decode("ascii")
-        image_media_type = self._image_media_type(image)
-        image_content = {
-            "type": "image_url",
-            "image_url": {"url": f"data:{image_media_type};base64,{encoded}"},
-        }
-        if self.ocr_profile in SPECIALIST_OCR_PROFILES:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        image_content,
-                        {
-                            "type": "text",
-                            "text": ocr_prompt_for_profile(self.ocr_profile),
-                        },
-                    ],
-                }
-            ]
-            temperature = 0
-        else:
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are the OCR engine for Paperless Clerk. Transcribe faithfully; never infer missing text.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Page {page_number}. {prompt}"},
-                        image_content,
-                    ],
-                },
-            ]
-            temperature = 0
-        payload = {
-            "model": self.model,
-            "temperature": temperature,
-            "max_tokens": self.max_output_tokens,
-            "messages": messages,
-        }
-        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
-            # Both DeepSeek serving stacks use the small request contract that
-            # predates the vLLM-specific tuning: one image, Free OCR, greedy
-            # decoding. This keeps the request constant when comparing native
-            # and GGUF inference.
-            payload["top_k"] = 1
-        body = await self._post(payload)
-        finish_reason = self._finish_reason(body)
-        if finish_reason in {"length", "max_tokens"}:
-            raise ModelError(
-                f"OCR output for page {page_number} reached the configured token limit"
-            )
-        if finish_reason in {"repetition", "repetition_detected"}:
-            raise ModelError(
-                f"OCR output for page {page_number} entered a repetition loop and was discarded"
-            )
-        text = self._content(body)
-        text = re.sub(r"^\s*<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(
-            r"^\s*```(?:text|markdown)?\s*\n?(.*?)\n?```\s*$",
-            r"\1",
-            text,
-            flags=re.DOTALL | re.IGNORECASE,
+    def _usage(body: dict[str, Any]) -> tuple[int | None, int | None]:
+        usage = body.get("usage")
+        if not isinstance(usage, dict):
+            return None, None
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        return (
+            prompt if isinstance(prompt, int) else None,
+            completion if isinstance(completion, int) else None,
         )
-        if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"}:
-            # Grounded document output prefixes recognized blocks with a paired
-            # layout-class reference and coordinate annotation. DeepSeek's own
-            # post-processor removes the entire pair; keeping the reference body
-            # would leak labels such as "text" and "sub_title" into OCR text.
-            annotation_pattern = re.compile(
-                r"<\|ref\|>.*?<\|/ref\|>\s*<\|det\|>.*?<\|/det\|>", re.DOTALL
+
+    def _truncation_detail(self, body: dict[str, Any]) -> str:
+        """Explain a truncated page from the token counts rather than guessing.
+
+        Stopping short of the requested cap means the server shortened it to fit
+        the context, which is a completely different fix from a model that
+        genuinely ran long, so never report one as the other.
+        """
+
+        prompt, completion = self._usage(body)
+        if completion is None:
+            return (
+                f"The server reported no token usage, so the cap it applied is unknown "
+                f"(this page requested {self.max_output_tokens})."
             )
-            layout_annotation_count = len(annotation_pattern.findall(text))
-            text = annotation_pattern.sub("", text)
-            # A partial pair has ambiguous contents: unwrapping it could publish
-            # a layout class such as `text` or `sub_title` as document text.
-            # DeepSeek's reference post-processor only removes complete pairs,
-            # so fail closed on malformed control-token output.
-            if re.search(r"<\|/?(?:ref|det)\|>", text):
-                raise ModelError("OCR model returned malformed layout annotations")
-            text = text.replace("<|grounding|>", "")
-            text = text.replace("<｜end▁of▁sentence｜>", "")
-            text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
-            text = re.sub(r"\n(?:[ \t]*\n){2,}", "\n\n", text)
-        if not text.strip():
-            if self.ocr_profile in {"deepseek_ocr", "deepseek_ocr_llamacpp"} and (
-                layout_annotation_count
-            ):
-                reason = finish_reason or "unspecified"
+        counts = f"prompt {prompt} + output {completion} tokens"
+        if completion < 0.95 * self.max_output_tokens:
+            room = f"{prompt + completion}" if prompt is not None else "the total"
+            return (
+                f"The server capped output at {completion} tokens even though "
+                f"{self.max_output_tokens} were requested ({counts}), so the image filled the "
+                f"context. Raise the server's context size above {room}, or lower the render DPI."
+            )
+        return (
+            f"The model produced the full {completion} tokens requested ({counts}) for one page, "
+            "which usually means it repeated itself rather than ran long."
+        )
+
+    async def ocr_page(self, image: bytes, *, page_number: int) -> str:
+        encoded = base64.b64encode(image).decode("ascii")
+        media_type = "image/png" if image.startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
+        messages: list[dict[str, Any]] = []
+        if self.profile.system:
+            messages.append({"role": "system", "content": self.profile.system})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{encoded}"},
+                    },
+                    {"type": "text", "text": self.profile.prompt},
+                ],
+            }
+        )
+        body = await self._post(
+            {
+                "model": self.model,
+                "temperature": 0,
+                "max_tokens": self.max_output_tokens,
+                "messages": messages,
+                **self.profile.extra_body,
+            }
+        )
+        truncated = self._finish_reason(body) == "length"
+        raw = self._content(body)
+        text = clean_ocr_text(raw)
+        if truncated:
+            # A page that ran out of tokens still transcribed everything before
+            # the cut, so keep that rather than failing the whole document. The
+            # document-level meaningful-text check is what decides whether the
+            # result is fit to publish.
+            kept = trim_runaway_repetition(text)
+            detail = self._truncation_detail(body)
+            if not kept:
                 raise ModelError(
-                    "OCR model returned "
-                    f"{layout_annotation_count} layout region(s) but no transcription text "
-                    f"(finish reason: {reason})"
+                    f"OCR page {page_number} was truncated with no usable text. {detail}"
                 )
-            raise ModelError(
-                "OCR model returned no transcription after removing response scaffolding"
+            log.warning(
+                "OCR page %s was truncated; keeping %s of %s characters. %s",
+                page_number,
+                len(kept),
+                len(text),
+                detail,
             )
-        refusal = text.strip().casefold()
-        if refusal.startswith(("i cannot", "i can't", "i am unable", "i'm unable", "sorry, i")):
-            raise ModelError(f"OCR model refused to transcribe page {page_number}")
-        return text.strip()
+            text = kept
+        if not text:
+            raise ModelError(
+                f"OCR model returned no transcription for page {page_number}. "
+                f"Raw response: {raw[:300]}"
+            )
+        if text.casefold().startswith(_REFUSAL_PREFIXES):
+            raise ModelError(f"OCR model refused to transcribe page {page_number}: {text[:200]}")
+        return text
 
     async def structured(
         self,
@@ -285,31 +341,24 @@ class OpenAICompatibleClient:
 
     async def test_connection(self) -> dict[str, Any]:
         if self.purpose == "ocr":
-            text = await self.ocr_page(
-                render_ocr_test_image(),
-                page_number=1,
-                prompt="Transcribe the clearly printed test text.",
-            )
+            # Send a real rendered page through the production request so the
+            # test exercises the vision path and the selected profile, then
+            # hand the transcription back for a human to judge.
+            text = await self.ocr_page(render_ocr_test_image(), page_number=1)
             normalized = re.sub(r"\s+", " ", text.casefold())
-            required_regions = {
-                "header": "paperless clerk",
-                "body reference": "4827",
-                "footer": "end of clerk ocr test",
-            }
-            missing_regions = [
-                name for name, marker in required_regions.items() if marker not in normalized
-            ]
-            if missing_regions:
+            if not any(
+                marker in normalized
+                for marker in ("paperless clerk", "4827", "end of clerk ocr test")
+            ):
                 raise ModelError(
-                    "OCR model responded but missed test image region(s): "
-                    f"{', '.join(missing_regions)}. Check the selected profile and matching "
-                    "multimodal projector."
+                    "OCR model responded but transcribed none of the test page's known text. "
+                    f"Check the model and profile. Response: {text[:200]}"
                 )
             return {
                 "ok": True,
                 "model": self.model,
-                "profile": self.ocr_profile,
-                "response": text[:80],
+                "profile": self.profile.key,
+                "response": text[:300],
             }
         body = await self._post(
             {

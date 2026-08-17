@@ -15,28 +15,22 @@ def _write_test_pdf(path: Path) -> None:
         document.close()
 
 
-def test_document_renderer_can_preserve_a_page_as_png(tmp_path: Path) -> None:
+def test_document_renderer_produces_a_jpeg_page(tmp_path: Path) -> None:
     path = tmp_path / "page.pdf"
     _write_test_pdf(path)
 
-    with DocumentRenderer(
-        path,
-        dpi=160,
-        max_pixels=16_000_000,
-        jpeg_quality=86,
-        image_format="png",
-    ) as renderer:
+    with DocumentRenderer(path, dpi=160, max_pixels=16_000_000, jpeg_quality=86) as renderer:
         image = renderer.render(0)
 
-    assert image.startswith(b"\x89PNG\r\n\x1a\n")
+    assert image.startswith(b"\xff\xd8")
+    assert pymupdf.Pixmap(image).width > 0
 
 
 def test_ocr_connection_fixture_is_a_realistic_page() -> None:
-    image = render_ocr_test_image("png")
+    image = render_ocr_test_image()
     pixmap = pymupdf.Pixmap(image)
 
-    with pymupdf.open(stream=image, filetype="png") as document:
-        page = document[0]
-        assert page.rect.height > page.rect.width
+    assert image.startswith(b"\xff\xd8")
+    assert pixmap.height > pixmap.width
     assert pixmap.width == 1224
     assert pixmap.height == 1584

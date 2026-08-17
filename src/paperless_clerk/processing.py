@@ -13,18 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from paperless_clerk.clients.ntfy import NtfyClient
-from paperless_clerk.clients.openai_compatible import (
-    OCR_REQUEST_CONTRACT_VERSION,
-    ModelError,
-    OpenAICompatibleClient,
-)
+from paperless_clerk.clients.openai_compatible import ModelError, OpenAICompatibleClient
 from paperless_clerk.clients.paperless import PaperlessClient, PaperlessError
 from paperless_clerk.config import Settings, SettingsManager
 from paperless_clerk.db import Database
 from paperless_clerk.domain.chunking import pages_from_assembled_text
 from paperless_clerk.domain.ocr_compare import assemble_pages, compare_ocr, meaningful_ocr
 from paperless_clerk.metadata import MetadataAnalyzer, MetadataPlanner, apply_metadata_plan
-from paperless_clerk.prompts import ocr_prompt_for_profile
+from paperless_clerk.ocr_profiles import ocr_profile
 from paperless_clerk.rendering import DocumentRenderer, RenderError
 
 log = logging.getLogger(__name__)
@@ -180,27 +176,20 @@ class DocumentProcessor:
         str,
     ]:
         self.database.update_job(job["id"], phase="downloading")
-        deepseek_profile = self.settings.ocr_profile in {
-            "deepseek_ocr",
-            "deepseek_ocr_llamacpp",
-        }
-        profile_prompt = ocr_prompt_for_profile(self.settings.ocr_profile)
-        image_format = "jpeg"
+        profile = ocr_profile(self.settings.ocr_profile)
+        # Everything that shapes the request. Recording it makes a working
+        # configuration recoverable from job history, and hashing it means a
+        # retry after any change re-runs pages instead of mixing contracts.
         request_configuration: dict[str, Any] = {
-            "contract_version": OCR_REQUEST_CONTRACT_VERSION,
             "model": self.settings.ocr_model,
-            "profile": self.settings.ocr_profile,
-            "context_tokens": self.settings.ocr_context_tokens,
+            "profile": profile.key,
+            "prompt": profile.prompt,
+            "extra_body": profile.extra_body,
             "max_output_tokens": self.settings.ocr_max_output_tokens,
             "render_dpi": self.settings.render_dpi,
             "max_image_pixels": self.settings.max_image_pixels,
-            "image_format": image_format,
-            "prompt": profile_prompt,
-            "decoding": {"temperature": 0},
+            "jpeg_quality": self.settings.jpeg_quality,
         }
-        request_configuration["jpeg_quality"] = self.settings.jpeg_quality
-        if deepseek_profile:
-            request_configuration["decoding"]["top_k"] = 1
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -225,7 +214,7 @@ class DocumentProcessor:
                 job["id"],
                 "info",
                 "ocr_configuration",
-                f"Using OCR model {self.settings.ocr_model} with profile {self.settings.ocr_profile}",
+                f"Using OCR model {self.settings.ocr_model} with profile {profile.key}",
                 request_configuration,
             )
         self.database.update_job(job["id"], ocr_fingerprint=fingerprint)
@@ -247,7 +236,6 @@ class DocumentProcessor:
                 dpi=self.settings.render_dpi,
                 max_pixels=self.settings.max_image_pixels,
                 jpeg_quality=self.settings.jpeg_quality,
-                image_format=image_format,
             ) as renderer:
                 total = renderer.page_count
                 if total < 1:
@@ -313,56 +301,29 @@ class DocumentProcessor:
 
         self.database.update_job(job["id"], phase="verifying_ocr")
         comparison = compare_ocr(existing, generated, self.settings.ocr_similarity_threshold)
-        # Similarity is symmetric, but replacement safety is not. If the new
-        # result omits a meaningful amount of text already present in
-        # Paperless, retain the system-of-record copy even when the overall
-        # document remains similar. Both OCR versions remain available in job
-        # diagnostics; no generated text is patched or heuristically repaired.
-        coverage_safeguard = bool(
+        # Similarity is symmetric; replacing the system of record is not. Two
+        # transcriptions can agree everywhere they overlap while the new one is
+        # simply missing a block, so never overwrite Paperless with a shorter
+        # result. Both versions stay in job diagnostics either way.
+        use_clerk = (
             comparison.is_similar
             and self.settings.prefer_clerk_ocr
-            and comparison.existing_coverage < 0.98
-            and (
-                comparison.existing_missing_tokens >= 5
-                or comparison.unmatched_existing_suffix_tokens >= 5
-            )
+            and comparison.generated_tokens >= 0.98 * comparison.existing_tokens
         )
         selected_source = (
-            "clerk"
-            if comparison.is_similar and self.settings.prefer_clerk_ocr and not coverage_safeguard
-            else "paperless"
-            if comparison.is_similar
-            else "manual_review"
+            "clerk" if use_clerk else "paperless" if comparison.is_similar else "manual_review"
         )
         self.database.add_event(
             job["id"],
-            "warning" if coverage_safeguard or not comparison.is_similar else "info",
+            "info" if comparison.is_similar else "warning",
             "ocr_compared",
             f"OCR comparison score {comparison.score:.3f}; selected {selected_source.replace('_', ' ')}",
-            {
-                **comparison.metrics(),
-                "selected_source": selected_source,
-                "coverage_safeguard": coverage_safeguard,
-            },
+            {**comparison.metrics(), "selected_source": selected_source},
         )
         if comparison.is_similar:
             selected_text = existing
             selected_pages = pages_from_assembled_text(existing)
-            if coverage_safeguard:
-                self.database.add_event(
-                    job["id"],
-                    "warning",
-                    "ocr_coverage_safeguard",
-                    "Retained Paperless OCR because Clerk omitted material existing text",
-                    {
-                        "existing_missing_tokens": comparison.existing_missing_tokens,
-                        "unmatched_existing_suffix_tokens": (
-                            comparison.unmatched_existing_suffix_tokens
-                        ),
-                        "existing_coverage": comparison.existing_coverage,
-                    },
-                )
-            elif self.settings.prefer_clerk_ocr:
+            if use_clerk:
                 selected_text = generated
                 selected_pages = pages
                 if generated != existing:
@@ -431,8 +392,7 @@ class DocumentProcessor:
             prior_attempts = int(existing.get(page_number, {}).get("attempts") or 0)
             started = time.monotonic()
             try:
-                prompt = ocr_prompt_for_profile(self.settings.ocr_profile)
-                text = await model.ocr_page(image, page_number=page_number, prompt=prompt)
+                text = await model.ocr_page(image, page_number=page_number)
                 duration = int((time.monotonic() - started) * 1000)
                 self.database.upsert_page(
                     job["id"],

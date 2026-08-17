@@ -6,6 +6,7 @@ import pytest
 
 from paperless_clerk.clients.openai_compatible import ModelError, OpenAICompatibleClient
 from paperless_clerk.config import Settings
+from paperless_clerk.ocr_profiles import GENERIC_PAGE_PROMPT, GENERIC_SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
@@ -60,8 +61,22 @@ async def test_structured_output_falls_back_without_consuming_retry_budget() -> 
     assert all('"answer"' in prompt for prompt in schema_prompts)
 
 
+async def _ocr_client(settings: Settings, handler) -> OpenAICompatibleClient:
+    client = OpenAICompatibleClient(settings, "ocr")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+def _responds(content: str, **choice: object):
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{**choice, "message": {"content": content}}]})
+
+    return handler
+
+
 @pytest.mark.asyncio
-async def test_ocr_response_scaffolding_is_removed() -> None:
+async def test_generic_profile_sends_a_system_prompt_and_strips_scaffolding() -> None:
     requests: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -79,228 +94,175 @@ async def test_ocr_response_scaffolding_is_removed() -> None:
             },
         )
 
-    client = OpenAICompatibleClient(Settings(), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"fake image", page_number=1, prompt="Transcribe")
+    client = await _ocr_client(Settings(), handler)
+    text = await client.ocr_page(b"fake image", page_number=1)
     await client.close()
 
     assert text == "Exact page text"
-    assert [message["role"] for message in requests[0]["messages"]] == ["system", "user"]
-    assert requests[0]["messages"][1]["content"][0]["text"] == "Page 1. Transcribe"
-    assert "top_k" not in requests[0]
-    assert "chat_template" not in requests[0]
-    assert "skip_special_tokens" not in requests[0]
-    assert "vllm_xargs" not in requests[0]
-    assert "repetition_detection" not in requests[0]
+    payload = requests[0]
+    assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+    assert "verbatim" in payload["messages"][0]["content"]
+    content = payload["messages"][1]["content"]
+    assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert content[1]["text"].startswith("Transcribe this page verbatim.")
+    # Nothing server-specific: this profile has to suit any OpenAI-compatible endpoint.
+    assert set(payload) == {"model", "temperature", "max_tokens", "messages"}
+
+
+def test_the_generic_prompt_keeps_its_load_bearing_instructions() -> None:
+    prompt = f"{GENERIC_SYSTEM_PROMPT}\n{GENERIC_PAGE_PROMPT}".casefold()
+
+    # A chat model that announces its answer, narrates the page, or protects the
+    # account numbers on it produces a filed document that is wrong rather than
+    # merely worse, and an empty reply for a blank page fails the whole job.
+    assert "no preamble" in prompt
+    assert "never redact" in prompt
+    assert "never describe, summarize" in prompt
+    assert "[blank page]" in prompt
+    assert "[illegible]" in prompt
+    # It must not read as a request to explain, or a reasoning model will oblige.
+    assert "?" not in prompt
 
 
 @pytest.mark.asyncio
-async def test_deepseek_ocr_vllm_profile_sends_native_request_contract() -> None:
+async def test_deepseek_vllm_profile_sends_the_recipe_repetition_guard(vllm_profiles: None) -> None:
     requests: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Exact specialist OCR text"}}]},
+            200, json={"choices": [{"message": {"content": "Exact specialist OCR text"}}]}
         )
 
-    client = OpenAICompatibleClient(
-        Settings(ocr_profile="deepseek_ocr", ocr_model="user.DeepSeek-OCR-2"), "ocr"
+    client = await _ocr_client(
+        Settings(ocr_profile="deepseek_ocr", ocr_model="user.DeepSeek-OCR-2"), handler
     )
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"jpeg image", page_number=9, prompt="generic prompt")
+    text = await client.ocr_page(b"jpeg image", page_number=9)
     await client.close()
 
     assert text == "Exact specialist OCR text"
     payload = requests[0]
+    assert payload["model"] == "user.DeepSeek-OCR-2"
     assert payload["temperature"] == 0
-    assert payload["top_k"] == 1
-    # vLLM owns the DeepSeek-OCR fallback template. Sending one in the request
-    # would require the unsafe-by-default --trust-request-chat-template flag.
-    assert "chat_template" not in payload
-    assert "skip_special_tokens" not in payload
-    assert "vllm_xargs" not in payload
-    assert "repetition_detection" not in payload
+    # The server-side NGramPerReqLogitsProcessor only engages when the request
+    # supplies its window. Without this half, dense pages loop to the limit.
+    assert payload["skip_special_tokens"] is False
+    assert payload["vllm_xargs"] == {
+        "ngram_size": 30,
+        "window_size": 90,
+        "whitelist_token_ids": [128821, 128822],
+    }
     assert len(payload["messages"]) == 1
-    assert payload["messages"][0]["role"] == "user"
     content = payload["messages"][0]["content"]
-    assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert content[1] == {"type": "text", "text": "Free OCR."}
     assert "Page 9" not in json.dumps(payload)
-    assert "generic prompt" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
-async def test_deepseek_ocr_llamacpp_profile_reproduces_the_earlier_gguf_contract() -> None:
+async def test_deepseek_llamacpp_profile_keeps_the_known_good_gguf_request() -> None:
     requests: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Exact GGUF OCR text"}}]},
-        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Exact GGUF text"}}]})
 
-    client = OpenAICompatibleClient(
-        Settings(
-            ocr_profile="deepseek_ocr_llamacpp",
-            ocr_model="sabafallah/DeepSeek-OCR-2-GGUF",
-        ),
-        "ocr",
+    client = await _ocr_client(
+        Settings(ocr_profile="deepseek_ocr_llamacpp", ocr_model="sabafallah/DeepSeek-OCR-2-GGUF"),
+        handler,
     )
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"jpeg image", page_number=2, prompt="generic prompt")
+    text = await client.ocr_page(b"jpeg image", page_number=2)
     await client.close()
 
-    assert text == "Exact GGUF OCR text"
+    assert text == "Exact GGUF text"
     payload = requests[0]
     assert payload["temperature"] == 0
     assert payload["top_k"] == 1
+    # llama.cpp has no logits processor to configure; the vLLM-only fields must
+    # never leak into the one serving path that already works.
     assert "skip_special_tokens" not in payload
     assert "vllm_xargs" not in payload
-    assert "repetition_detection" not in payload
+    assert len(payload["messages"]) == 1
     content = payload["messages"][0]["content"]
     assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert content[1] == {"type": "text", "text": "Free OCR."}
 
 
 @pytest.mark.asyncio
-async def test_glm_ocr_profile_sends_native_vllm_request_contract() -> None:
+async def test_glm_ocr_profile_sends_its_native_task_command(vllm_profiles: None) -> None:
     requests: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Exact GLM OCR text"}}]},
-        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Exact GLM text"}}]})
 
-    client = OpenAICompatibleClient(
-        Settings(
-            ocr_profile="glm_ocr",
-            ocr_model="user.GLM-OCR-vLLM",
-            ocr_max_output_tokens=2345,
-        ),
-        "ocr",
+    client = await _ocr_client(
+        Settings(ocr_profile="glm_ocr", ocr_model="user.GLM-OCR-vLLM", ocr_max_output_tokens=2345),
+        handler,
     )
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"jpeg image", page_number=4, prompt="generic prompt")
+    text = await client.ocr_page(b"jpeg image", page_number=4)
     await client.close()
 
-    assert text == "Exact GLM OCR text"
+    assert text == "Exact GLM text"
     payload = requests[0]
     assert payload["model"] == "user.GLM-OCR-vLLM"
     assert payload["max_tokens"] == 2345
     assert payload["temperature"] == 0
     assert "top_k" not in payload
-    assert "chat_template" not in payload
     assert "skip_special_tokens" not in payload
     assert "vllm_xargs" not in payload
     assert len(payload["messages"]) == 1
-    assert payload["messages"][0]["role"] == "user"
     content = payload["messages"][0]["content"]
-    assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert content[1] == {"type": "text", "text": "Text Recognition:"}
-    assert "Page 4" not in json.dumps(payload)
-    assert "generic prompt" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
-async def test_deepseek_profile_removes_layout_annotations_but_keeps_ocr_text() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                "<|grounding|><|ref|>text<|/ref|>"
-                                "<|det|>[[10, 20, 30, 40]]<|/det|>\nInvoice\n\n\n"
-                                "<|ref|>sub_title<|/ref|>"
-                                "<|det|>[[10, 50, 30, 70]]<|/det|>\n## Total\n$25.00"
-                                "<｜end▁of▁sentence｜>"
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+async def test_grounding_annotations_and_control_tokens_are_removed(vllm_profiles: None) -> None:
+    client = await _ocr_client(
+        Settings(ocr_profile="deepseek_ocr"),
+        _responds(
+            "<|grounding|><|ref|>text<|/ref|>"
+            "<|det|>[[10, 20, 30, 40]]<|/det|>\nInvoice\n\n\n"
+            "<|ref|>sub_title<|/ref|>"
+            "<|det|>[[10, 50, 30, 70]]<|/det|>\n## Total\n$25.00"
+            "<｜end▁of▁sentence｜>"
+        ),
+    )
+    text = await client.ocr_page(b"fake image", page_number=1)
     await client.close()
 
     assert text == "Invoice\n\n## Total\n$25.00"
-    assert "sub_title" not in text
 
 
 @pytest.mark.asyncio
-async def test_deepseek_profile_rejects_annotation_only_output() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                "<|ref|>text<|/ref|>"
-                                "<|det|>[[10, 20, 300, 80]]<|/det|>"
-                                "<｜end▁of▁sentence｜>"
-                            )
-                        }
-                    }
-                ]
-            },
-        )
+async def test_an_unpaired_layout_label_is_removed_rather_than_published(
+    vllm_profiles: None,
+) -> None:
+    client = await _ocr_client(
+        Settings(ocr_profile="deepseek_ocr"),
+        _responds("<|ref|>sub_title<|/ref|>Amount due 25.00"),
+    )
+    text = await client.ocr_page(b"fake image", page_number=1)
+    await client.close()
 
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert text == "Amount due 25.00"
 
-    with pytest.raises(ModelError, match=r"1 layout region\(s\) but no transcription.*unspecified"):
-        await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+
+@pytest.mark.asyncio
+async def test_annotation_only_output_reports_the_raw_response(vllm_profiles: None) -> None:
+    client = await _ocr_client(
+        Settings(ocr_profile="deepseek_ocr", model_max_retries=0),
+        _responds("<|ref|>text<|/ref|><|det|>[[10, 20, 300, 80]]<|/det|>"),
+    )
+
+    with pytest.raises(ModelError, match=r"no transcription for page 1.*<\|ref\|>"):
+        await client.ocr_page(b"fake image", page_number=1)
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_deepseek_profile_rejects_partial_layout_annotations() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {"message": {"content": "<|ref|>sub_title<|/ref|>This must not be published"}}
-                ]
-            },
-        )
-
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    with pytest.raises(ModelError, match="malformed layout annotations"):
-        await client.ocr_page(b"fake image", page_number=1, prompt="unused")
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
+async def test_ocr_connection_test_exercises_a_real_image_request(vllm_profiles: None) -> None:
     requests: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -320,10 +282,7 @@ async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
             },
         )
 
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
+    client = await _ocr_client(Settings(ocr_profile="deepseek_ocr"), handler)
     result = await client.test_connection()
     await client.close()
 
@@ -340,109 +299,106 @@ async def test_ocr_connection_test_exercises_a_real_image_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ocr_connection_test_rejects_a_missing_footer_region() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "PAPERLESS CLERK\nReference number: 4827"}}]},
-        )
+async def test_ocr_connection_test_accepts_a_partial_but_recognizable_read() -> None:
+    client = await _ocr_client(
+        Settings(),
+        _responds("PAPERLESS CLERK\nReference number: 4827"),
+    )
+    result = await client.test_connection()
+    await client.close()
 
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert result["ok"] is True
+    assert result["response"] == "PAPERLESS CLERK\nReference number: 4827"
 
-    with pytest.raises(ModelError, match=r"missed test image region\(s\): footer"):
+
+@pytest.mark.asyncio
+async def test_ocr_connection_test_fails_when_nothing_recognizable_is_read() -> None:
+    client = await _ocr_client(Settings(), _responds("Lorem ipsum dolor sit amet"))
+
+    with pytest.raises(ModelError, match="Lorem ipsum"):
         await client.test_connection()
     await client.close()
 
 
-@pytest.mark.asyncio
-async def test_truncated_ocr_page_is_rejected() -> None:
+def _responds_with_usage(content: str, *, prompt: int, completion: int, **choice: object):
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "choices": [
-                    {
-                        "finish_reason": "length",
-                        "message": {"content": "A partial page that must not be published"},
-                    }
-                ]
+                "choices": [{**choice, "message": {"content": content}}],
+                "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
             },
         )
 
-    client = OpenAICompatibleClient(Settings(), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return handler
 
-    with pytest.raises(ModelError, match="token limit"):
-        await client.ocr_page(b"fake image", page_number=7, prompt="Transcribe")
+
+@pytest.mark.asyncio
+async def test_truncated_page_keeps_the_text_transcribed_before_the_cut() -> None:
+    partial = "Charles Schwab address change confirmation for account 4827."
+    client = await _ocr_client(
+        Settings(ocr_max_output_tokens=512),
+        _responds(partial, finish_reason="length"),
+    )
+
+    assert await client.ocr_page(b"fake image", page_number=7) == partial
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_deepseek_token_limited_output_is_rejected() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "length",
-                        "message": {"content": "Charles Schwab " * 100},
-                    }
-                ]
-            },
-        )
+async def test_truncated_page_drops_a_runaway_decoder_loop() -> None:
+    looped = "Real page text.\n" + "Page 1 of 1\n" * 40
+    client = await _ocr_client(
+        Settings(ocr_max_output_tokens=512),
+        _responds(looped, finish_reason="length"),
+    )
 
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    with pytest.raises(ModelError, match="configured token limit"):
-        await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+    text = await client.ocr_page(b"fake image", page_number=7)
+    assert text == "Real page text.\nPage 1 of 1"
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_server_repetition_finish_discards_partial_text() -> None:
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "repetition",
-                        "message": {"content": "Charles Schwab " * 8},
-                    }
-                ]
-            },
-        )
+async def test_truncation_with_nothing_left_after_cleaning_still_fails() -> None:
+    client = await _ocr_client(
+        Settings(ocr_max_output_tokens=512),
+        _responds_with_usage(
+            "<|end▁of▁sentence|>", prompt=3053, completion=512, finish_reason="length"
+        ),
+    )
 
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ModelError, match="no usable text"):
+        await client.ocr_page(b"fake image", page_number=1)
+    await client.close()
 
-    with pytest.raises(ModelError, match="repetition loop and was discarded"):
-        await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+
+@pytest.mark.asyncio
+async def test_truncation_short_of_the_request_blames_the_context_not_the_output() -> None:
+    """A server clamping output to fit the image needs a different fix than a loop."""
+
+    client = await _ocr_client(Settings(ocr_max_output_tokens=4096), _responds("x"))
+    detail = client._truncation_detail({"usage": {"prompt_tokens": 7800, "completion_tokens": 390}})
+
+    assert "image filled the context" in detail
+    assert "8190" in detail  # the context size the server actually needs to clear
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_truncation_at_the_full_request_blames_repetition() -> None:
+    client = await _ocr_client(Settings(ocr_max_output_tokens=512), _responds("x"))
+    detail = client._truncation_detail({"usage": {"prompt_tokens": 3053, "completion_tokens": 512}})
+
+    assert "repeated itself" in detail
     await client.close()
 
 
 @pytest.mark.asyncio
 async def test_legitimate_repeated_ocr_text_is_never_rewritten_by_the_client() -> None:
     repeated = "Section 12 shall remain in effect. " * 10
+    client = await _ocr_client(Settings(), _responds(repeated, finish_reason="stop"))
 
-    async def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"finish_reason": "stop", "message": {"content": repeated}}]},
-        )
-
-    client = OpenAICompatibleClient(Settings(ocr_profile="deepseek_ocr"), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    text = await client.ocr_page(b"fake image", page_number=1, prompt="unused")
+    text = await client.ocr_page(b"fake image", page_number=1)
     await client.close()
 
     assert text == repeated.strip()
@@ -453,12 +409,10 @@ async def test_empty_choices_are_reported_as_a_model_error() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": []})
 
-    client = OpenAICompatibleClient(Settings(model_max_retries=0), "ocr")
-    await client.client.aclose()
-    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = await _ocr_client(Settings(model_max_retries=0), handler)
 
     with pytest.raises(ModelError, match=r"choices\[0\]"):
-        await client.ocr_page(b"fake image", page_number=1, prompt="Transcribe")
+        await client.ocr_page(b"fake image", page_number=1)
     await client.close()
 
 

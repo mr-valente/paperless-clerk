@@ -67,7 +67,9 @@ crashed worker can resume work after restart.
    token multiset overlap, vocabulary overlap, ordered shingles, length
    agreement, and numeric-token agreement.
 8. Similar OCR selects Clerk or the existing Paperless content according to the
-   configured source preference. Divergent OCR creates a durable conflict
+   configured source preference. Clerk OCR is never published over a longer
+   existing transcription, because agreement across the overlap does not prove
+   the new reading is complete. Divergent OCR creates a durable conflict
    containing both versions and comparison evidence, adds the `ocr-conflict`
    tag, and stops before metadata classification.
 9. Conflict resolution re-fetches the live Paperless document. Keeping
