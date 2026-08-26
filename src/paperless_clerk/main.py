@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -10,7 +11,7 @@ from typing import Any, TextIO
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from paperless_clerk import __version__
@@ -24,6 +25,26 @@ from paperless_clerk.schemas import EnqueueRequest, ResolveConflictRequest, Sett
 
 log = logging.getLogger(__name__)
 STATIC_DIRECTORY = Path(__file__).parent / "static"
+STATIC_ASSET_NAMES = ("app.js", "styles.css", "favicon.svg")
+
+
+def _static_asset_version(directory: Path) -> str:
+    """Fingerprint every browser asset so any content change gets a new URL."""
+    digest = hashlib.sha256()
+    for name in STATIC_ASSET_NAMES:
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update((directory / name).read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+STATIC_ASSET_VERSION = _static_asset_version(STATIC_DIRECTORY)
+INDEX_HTML = (
+    (STATIC_DIRECTORY / "index.html")
+    .read_text()
+    .replace("__STATIC_ASSET_VERSION__", STATIC_ASSET_VERSION)
+)
 
 
 def _configure_application_logging(
@@ -112,10 +133,15 @@ app = FastAPI(
 
 
 @app.middleware("http")
-async def private_api_cache_control(request: Request, call_next: Any) -> Response:
+async def response_cache_control(request: Request, call_next: Any) -> Response:
     response = await call_next(request)
     if request.url.path.startswith("/api/") and "cache-control" not in response.headers:
         response.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/assets/") and "cache-control" not in response.headers:
+        if request.query_params.get("v") == STATIC_ASSET_VERSION:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
     return response
 
 
@@ -354,10 +380,10 @@ app.mount("/assets", StaticFiles(directory=STATIC_DIRECTORY), name="assets")
 
 
 @app.get("/{path:path}", include_in_schema=False)
-async def single_page_app(path: str) -> FileResponse:
+async def single_page_app(path: str) -> HTMLResponse:
     if path.startswith("api/"):
         raise HTTPException(status_code=404, detail="API endpoint not found")
-    return FileResponse(STATIC_DIRECTORY / "index.html", headers={"Cache-Control": "no-cache"})
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
 
 
 def run() -> None:

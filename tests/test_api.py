@@ -7,7 +7,13 @@ import pytest
 
 from paperless_clerk.config import SettingsManager
 from paperless_clerk.db import Database
-from paperless_clerk.main import _configure_application_logging, app
+from paperless_clerk.main import (
+    STATIC_ASSET_NAMES,
+    STATIC_ASSET_VERSION,
+    _configure_application_logging,
+    _static_asset_version,
+    app,
+)
 
 
 class FakeManager:
@@ -35,15 +41,24 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     ):
         health = await client.get("/api/health")
         page = await client.get("/")
-        script = await client.get("/assets/app.js")
-        styles = await client.get("/assets/styles.css")
-        favicon = await client.get("/assets/favicon.svg")
+        script = await client.get(f"/assets/app.js?v={STATIC_ASSET_VERSION}")
+        styles = await client.get(f"/assets/styles.css?v={STATIC_ASSET_VERSION}")
+        favicon = await client.get(f"/assets/favicon.svg?v={STATIC_ASSET_VERSION}")
+        unversioned_script = await client.get("/assets/app.js")
 
     assert health.status_code == 200
     assert health.headers["cache-control"] == "no-store"
     assert page.status_code == 200
+    assert page.headers["cache-control"] == "no-cache"
     assert "Paperless Clerk" in page.text
+    assert f"/assets/app.js?v={STATIC_ASSET_VERSION}" in page.text
+    assert f"/assets/styles.css?v={STATIC_ASSET_VERSION}" in page.text
+    assert f"/assets/favicon.svg?v={STATIC_ASSET_VERSION}" in page.text
     assert script.status_code == 200
+    assert script.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert styles.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert favicon.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert unversioned_script.headers["cache-control"] == "no-cache"
     assert "renderOverview" in script.text
     assert "ocr_profile_choices" in script.text
     assert "Keep original document version" in script.text
@@ -69,6 +84,19 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert styles.status_code == 200
     assert ".grid > .panel + .panel" in styles.text
     assert (tmp_path / "clerk.db").exists()
+
+
+@pytest.mark.parametrize("changed_name", STATIC_ASSET_NAMES)
+def test_static_asset_version_changes_with_asset_content(tmp_path: Path, changed_name: str) -> None:
+    for name in STATIC_ASSET_NAMES:
+        (tmp_path / name).write_text(f"initial {name}")
+    initial = _static_asset_version(tmp_path)
+
+    (tmp_path / changed_name).write_text(f"changed {changed_name}")
+
+    changed = _static_asset_version(tmp_path)
+    assert len(initial) == 16
+    assert initial != changed
 
 
 @pytest.mark.asyncio

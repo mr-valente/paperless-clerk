@@ -175,4 +175,7 @@ exhausted jobs while retaining distinct actions. Conflict detail is loaded only
 on demand and presents both texts, scores, and mismatch excerpts. Decision
 detail includes an on-demand diagnostic log containing the bounded model and
 validation trace. Manual processing is always available from the overview and
-jobs views.
+jobs views. The HTML is revalidated on every visit and references JavaScript,
+CSS, and favicon assets with a shared content-derived fingerprint. Changed
+assets therefore receive new URLs, while matching fingerprinted assets can be
+cached immutably.
