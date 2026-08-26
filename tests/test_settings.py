@@ -40,6 +40,27 @@ def test_ocr_profile_defaults_to_generic_and_accepts_specialists() -> None:
         Settings(ocr_profile="some-other-model")
 
 
+def test_original_ocr_version_retention_defaults_on_and_can_be_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings().keep_original_version is True
+    assert Settings(keep_original_version=False).keep_original_version is False
+
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    manager = SettingsManager(db)
+    manager.update({"keep_original_version": False})
+
+    assert SettingsManager(db).get().keep_original_version is False
+
+    monkeypatch.setenv("CLERK_KEEP_ORIGINAL_VERSION", "true")
+    environment_managed = SettingsManager(db).get()
+
+    assert environment_managed.keep_original_version is True
+    assert "keep_original_version" in environment_managed.public_dict()["environment_overrides"]
+
+
 def test_held_back_vllm_profiles_are_offered_only_behind_the_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

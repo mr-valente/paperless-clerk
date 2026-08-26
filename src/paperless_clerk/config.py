@@ -27,6 +27,7 @@ class Settings(BaseModel):
     openai_api_key: SecretStr = SecretStr("")
     ocr_model: str = "qwen2.5vl:7b"
     ocr_profile: str = "generic"
+    keep_original_version: bool = True
     # No OCR context setting: one page image plus a short command is the whole
     # request, so the server's own context is the only limit that matters and
     # it already clamps an oversized output request.
@@ -169,6 +170,7 @@ ENVIRONMENT_FIELDS = {
     "CLERK_OPENAI_API_KEY": "openai_api_key",
     "CLERK_OCR_MODEL": "ocr_model",
     "CLERK_OCR_PROFILE": "ocr_profile",
+    "CLERK_KEEP_ORIGINAL_VERSION": "keep_original_version",
     "CLERK_OCR_MAX_OUTPUT_TOKENS": "ocr_max_output_tokens",
     "CLERK_METADATA_MODEL": "metadata_model",
     "CLERK_METADATA_CONTEXT_TOKENS": "metadata_context_tokens",

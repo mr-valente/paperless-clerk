@@ -46,7 +46,7 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert script.status_code == 200
     assert "renderOverview" in script.text
     assert "ocr_profile_choices" in script.text
-    assert "Existing Paperless OCR is retained as a backup file version" in script.text
+    assert "Keep original document version" in script.text
     assert "Prefer Clerk OCR after a trusted match" not in script.text
     assert "OCR review versions" in script.text
     assert "Paperless had no OCR baseline" in script.text
@@ -83,6 +83,9 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://clerk.local") as client:
         health = await client.get("/api/health")
         settings = await client.get("/api/settings")
+        changed = await client.patch(
+            "/api/settings", json={"values": {"keep_original_version": False}}
+        )
         queued = await client.post(
             "/api/jobs", json={"document_ids": [42, 42, 43], "mode": "metadata"}
         )
@@ -97,6 +100,10 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     assert "ntfy_token_configured" in settings.json()
     assert settings.json()["notifications_enabled"] is False
     assert settings.json()["ocr_profile"] == "generic"
+    assert settings.json()["keep_original_version"] is True
+    assert changed.status_code == 200
+    assert changed.json()["settings"]["keep_original_version"] is False
+    assert changed.json()["restart_required"] == []
     # The vLLM profiles are held back, so the UI offers only the working two.
     assert [choice["key"] for choice in settings.json()["ocr_profile_choices"]] == [
         "generic",
@@ -107,6 +114,7 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     assert "metadata_base_url" not in settings.json()
     assert [item["job"]["document_id"] for item in queued.json()["jobs"]] == [42, 43]
     assert app.state.job_manager.wakes == 1
+    assert app.state.job_manager.settings_changes == 1
 
 
 def test_clerk_logging_has_a_dedicated_stream_handler() -> None:

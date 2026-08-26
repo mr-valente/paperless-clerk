@@ -29,11 +29,11 @@ Paperless-ngx's current API supports the operations Clerk needs:
 - Tags, correspondents, document types, and custom fields are paginated API
   resources and can be created independently.
 
-Clerk updates OCR text through the version-specific `content` field. When a
-baseline exists it uploads the unchanged current file to let Paperless create a
-new version; it never deletes or rewrites the prior version and does not attempt
-to reproduce Paperless storage itself. This contract requires Paperless-ngx 3.0
-or newer.
+Clerk updates OCR text through the `content` field. With
+`keep_original_version` enabled, a baseline causes it to upload the unchanged
+current file and target the new version's content; it never deletes or rewrites
+the prior version. With retention disabled, it targets the current version
+directly. The optional version contract requires Paperless-ngx 3.0 or newer.
 
 ## Components
 
@@ -71,8 +71,10 @@ crashed worker can resume work after restart.
    during inference, recheck the source hash; a changed source retries from its
    new pages. If there is still no meaningful content, Clerk patches the
    complete assembled OCR onto the current version.
-8. If meaningful content exists, upload the unchanged current file through the
-   version endpoint with label `Paperless Clerk OCR`. Record an upload-started
+8. If meaningful content exists and `keep_original_version` is disabled, patch
+   the complete Clerk text directly onto the current latest version without an
+   upload. If retention is enabled, upload the unchanged current file through
+   the version endpoint with label `Paperless Clerk OCR`. Record an upload-started
    checkpoint before the POST, persist the returned task UUID before polling it,
    then persist the created version ID. A timeout or restart resumes that same
    Paperless task rather than uploading again. If the POST response is lost
@@ -160,9 +162,10 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 - Container logs expose lifecycle, counts, and concise validation errors. A
   full Decision detail can reveal bounded invalid-output previews on demand,
   but never retains the source OCR or request prompt in that diagnostic log.
-- No Paperless OCR is published on partial OCR or model failure. Existing OCR is
-  moved behind a new latest version only after the complete Clerk result passes
-  local validation; its prior version remains intact.
+- No Paperless OCR is published on partial OCR or model failure. Only after the
+  complete Clerk result passes local validation is existing OCR either moved
+  behind a new latest version or replaced on the current version, according to
+  `keep_original_version`.
 
 ## UI information architecture
 

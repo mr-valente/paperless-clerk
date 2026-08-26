@@ -284,8 +284,8 @@ class DocumentProcessor:
                 "The complete OCR result did not contain enough meaningful text to publish",
             )
         # OCR can take a long time. Re-read Paperless before any decision so a
-        # user correction made while the model was running is never replaced
-        # or compared against a stale snapshot.
+        # user correction made while the model was running is never published
+        # against a stale snapshot.
         live_document = await paperless.get_document(int(document["id"]))
         if live_document.get("modified") != document.get("modified"):
             with tempfile.TemporaryDirectory(prefix="paperless-clerk-recheck-") as directory:
@@ -301,15 +301,29 @@ class DocumentProcessor:
         document = live_document
         existing = str(document.get("content") or "")
         has_paperless_ocr = meaningful_ocr(existing, self.settings.ocr_min_chars)
-        if not has_paperless_ocr:
+        # Once a version upload has started, always finish or safely resume it;
+        # changing the setting mid-retry cannot undo a Paperless task that may
+        # already have created a version. Jobs without a version checkpoint
+        # directly replace the latest version when retention is disabled.
+        use_version_backup = has_paperless_ocr and (
+            self.settings.keep_original_version
+            or version_task_id is not None
+            or version_id is not None
+        )
+        if not use_version_backup:
             self.database.update_job(job["id"], phase="publishing_ocr")
             updated = await paperless.update_document(int(document["id"]), {"content": generated})
+            message = (
+                f"Replaced existing Paperless OCR with complete OCR from {len(pages)} page(s)"
+                if has_paperless_ocr
+                else f"Published complete OCR from {len(pages)} page(s)"
+            )
             self.database.add_event(
                 job["id"],
                 "info",
                 "ocr_published",
-                f"Published complete OCR from {len(pages)} page(s)",
-                {"pages": len(pages)},
+                message,
+                {"pages": len(pages), "replaced_existing": has_paperless_ocr},
             )
             if job["mode"] == "ocr":
                 return (

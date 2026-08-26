@@ -196,8 +196,9 @@ class OCRPreferencePaperless:
         assert document_id == 92
         self.patches.append(patch)
         self.version_patches.append((version_id, patch))
-        if "content" in patch and version_id is not None:
-            self.version_contents[version_id] = patch["content"]
+        if "content" in patch:
+            target_version_id = version_id or self.document["versions"][0]["id"]
+            self.version_contents[target_version_id] = patch["content"]
         self.document.update(patch)
         self.document["modified"] = "2026-08-13T12:01:00Z"
         return dict(self.document)
@@ -444,7 +445,7 @@ async def test_ocr_publishing_backs_up_text_added_while_clerk_was_working(
 
 
 @pytest.mark.asyncio
-async def test_existing_ocr_always_becomes_a_backup_version(
+async def test_existing_ocr_becomes_a_backup_version_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -483,6 +484,39 @@ async def test_existing_ocr_always_becomes_a_backup_version(
     checkpoint = db.get_job(job["id"])
     assert checkpoint["ocr_version_task_id"] == "version-task-92"
     assert checkpoint["ocr_version_id"] == 192
+
+
+@pytest.mark.asyncio
+async def test_existing_ocr_is_replaced_without_a_version_when_retention_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = OCRPreferencePaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(keep_original_version=False)
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert updated["content"] == text
+    assert paperless.version_patches == [(None, {"content": text})]
+    assert paperless.version_contents[92] == text
+    assert paperless.uploads == []
+    assert paperless.version_labels == []
+    checkpoint = db.get_job(job["id"])
+    assert checkpoint and checkpoint["ocr_version_task_id"] is None
+    events = db.get_job(job["id"], include_events=True)["events"]
+    published = next(event for event in events if event["event_type"] == "ocr_published")
+    assert published["data"]["replaced_existing"] is True
 
 
 @pytest.mark.asyncio
@@ -531,7 +565,7 @@ async def test_pending_version_task_is_resumed_without_another_upload(
     paperless = OCRPreferencePaperless()
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
-    await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
+    await DocumentProcessor(db, Settings(keep_original_version=False))._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
         paperless,  # type: ignore[arg-type]

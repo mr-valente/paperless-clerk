@@ -2,9 +2,9 @@
 
 Paperless Clerk is a focused local-AI sidecar for
 [Paperless-ngx](https://docs.paperless-ngx.com/). It reads documents page by
-page, retains existing OCR as a Paperless file-version backup, publishes Clerk
-OCR as the default version, and classifies each document against the metadata
-system already living in Paperless.
+page, publishes Clerk OCR, optionally retains existing OCR as a Paperless
+file-version backup, and classifies each document against the metadata system
+already living in Paperless.
 
 Its filing rule is simple:
 
@@ -19,9 +19,10 @@ model can transcribe pages while a smaller text model handles classification.
 - OCRs every page independently with bounded concurrency and persisted page
   results.
 - Writes complete OCR into Paperless only after every page succeeds.
-- When meaningful OCR already exists, preserves its complete file and text as a
-  `Pre-Clerk OCR backup` version and creates a latest `Paperless Clerk OCR`
-  version containing Clerk's text.
+- By default, when meaningful OCR already exists, preserves its complete file
+  and text as a `Pre-Clerk OCR backup` version and creates a latest
+  `Paperless Clerk OCR` version containing Clerk's text. This can be disabled to
+  replace OCR on the current version instead.
 - Persists and polls Paperless's asynchronous version task so retries resume the
   same upload instead of creating another version.
 - Classifies correspondents, document types, tags, titles, intrinsic dates, and
@@ -38,7 +39,7 @@ model can transcribe pages while a smaller text model handles classification.
 
 Clerk does not replace Paperless storage, rewrite source files, provide chat or
 RAG, connect to hosted AI services, or mirror the Paperless document library.
-The version workflow requires Paperless-ngx 3.0 or newer.
+The optional backup-version workflow requires Paperless-ngx 3.0 or newer.
 
 ## Quick start with Docker Compose
 
@@ -85,11 +86,13 @@ For a manual or discovered document:
    retry skips those pages if the source has not changed.
 4. If Paperless has no meaningful content, Clerk patches the complete OCR output
    on the current version.
-5. If content exists, Clerk uploads the unchanged current file as a new version,
-   waits for Paperless consumption to complete, labels the prior version as a
-   backup when it had no label, and patches Clerk OCR onto the explicit new
-   version. That version is latest, so Paperless search and content use it by
-   default while the original reading remains available in version history.
+5. If content exists and **Keep original document version** is enabled,
+   Clerk uploads the unchanged current file as a new version, waits for
+   Paperless consumption to complete, labels the prior version as a backup when
+   it had no label, and patches Clerk OCR onto the explicit new version. That
+   version is latest while the original reading remains in version history. If
+   the setting is disabled, Clerk patches the complete result directly onto the
+   current version without creating a backup.
 6. Metadata text is split at page/paragraph boundaries. Map calls extract
    compact candidates; hierarchical reduce calls operate on those candidates,
    never on the whole source document.
@@ -416,6 +419,7 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_OPENAI_API_KEY` | empty | Optional bearer token shared by both model clients |
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
 | `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic` or `deepseek_ocr_llamacpp` (plus `deepseek_ocr` and `glm_ocr` when unhidden below) |
+| `CLERK_KEEP_ORIGINAL_VERSION` | `true` | Retain existing OCR as a backup file version; `false` replaces OCR on the current version |
 | `CLERK_ENABLE_VLLM_PROFILES` | unset | Offer the held-back `deepseek_ocr` and `glm_ocr` profiles again |
 | `CLERK_OCR_MAX_OUTPUT_TOKENS` | `4096` | Per-page OCR output cap; must fit the serving context alongside the page image |
 | `CLERK_METADATA_MODEL` | `qwen2.5:14b` | Metadata model name |
@@ -488,10 +492,12 @@ default and supports only safely typed definitions.
 
 ## Versions, corrections, and legacy conflicts
 
-The prior reading remains selectable in Paperless's document version history,
-so correction normally means choosing or editing a version in Paperless rather
-than blocking Clerk's job. Clerk never publishes partial, empty, or rejected
-model output; those remain genuine failures/interventions.
+With original-version retention enabled, the prior reading remains selectable
+in Paperless's document version history, so correction normally means choosing
+or editing a version in Paperless rather than blocking Clerk's job. With it
+disabled, the validated complete Clerk result replaces current OCR without a
+backup. Clerk never publishes partial, empty, or rejected model output; those
+remain genuine failures/interventions.
 
 Databases upgraded from the older comparison workflow may still contain open OCR
 conflicts. The Intervention screen and conflict-resolution API remain available
@@ -523,7 +529,8 @@ deliberately excludes full OCR text and model request prompts.
 - Page failures do not cancel successful sibling pages and never publish a
   partial document.
 - Paperless OCR is not replaced after a model parse error or partial page run.
-  The prior version is retained before a complete Clerk result becomes latest.
+  Before publishing a complete result, Clerk either retains the prior version
+  or intentionally replaces its OCR according to the configured setting.
 - At the default `INFO` level, container logs include job lifecycle, metadata
   outcomes, tag-review counts, retries, and concise validation failures. They
   never include document contents or model prompts. Clerk installs its own
