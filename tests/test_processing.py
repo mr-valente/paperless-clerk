@@ -103,7 +103,19 @@ class FooterOmittingOCRModel:
 
 class OCRCorrectedDuringRunPaperless:
     def __init__(self):
-        self.patches: list[dict] = []
+        self.document = {
+            "id": 89,
+            "title": "Corrected statement",
+            "content": (
+                "Acme issued this detailed monthly statement with account totals and payment history."
+            ),
+            "modified": "2026-08-13T12:00:00Z",
+            "tags": [],
+            "versions": [{"id": 89, "version_label": None, "is_root": True, "checksum": "source"}],
+        }
+        self.patches: list[tuple[int | None, dict]] = []
+        self.version_labels: list[tuple[int, str]] = []
+        self.uploads = 0
         self.downloads = 0
 
     async def download_document(self, document_id: int, destination: Path) -> str:
@@ -111,18 +123,42 @@ class OCRCorrectedDuringRunPaperless:
         return "same-source-hash"
 
     async def get_document(self, document_id: int) -> dict:
-        return {
-            "id": document_id,
-            "title": "Corrected statement",
-            "content": (
-                "Acme issued this detailed monthly statement with account totals and payment history."
-            ),
-            "modified": "2026-08-13T12:00:00Z",
-            "tags": [],
-        }
+        return {**self.document, "versions": [dict(item) for item in self.document["versions"]]}
 
-    async def update_document(self, document_id: int, patch: dict) -> dict:
-        self.patches.append(patch)
+    async def upload_document_version(self, *args: object, **kwargs: object) -> str:
+        self.uploads += 1
+        return "version-task-89"
+
+    async def wait_for_task(self, task_id: str, **_: object) -> dict:
+        assert task_id == "version-task-89"
+        if self.document["versions"][0]["id"] != 189:
+            self.document["versions"].insert(
+                0,
+                {
+                    "id": 189,
+                    "version_label": "Paperless Clerk OCR",
+                    "is_root": False,
+                    "checksum": "source",
+                },
+            )
+        return {"status": "success", "result_data": {"document_id": 189}}
+
+    async def update_version_label(
+        self, document_id: int, version_id: int, version_label: str
+    ) -> dict:
+        self.version_labels.append((version_id, version_label))
+        for version in self.document["versions"]:
+            if version["id"] == version_id:
+                version["version_label"] = version_label
+                return dict(version)
+        raise AssertionError("version not found")
+
+    async def update_document(
+        self, document_id: int, patch: dict, *, version_id: int | None = None
+    ) -> dict:
+        self.patches.append((version_id, patch))
+        self.document.update(patch)
+        self.document["modified"] = "2026-08-13T12:02:00Z"
         return await self.get_document(document_id)
 
 
@@ -136,8 +172,15 @@ class OCRPreferencePaperless:
             ),
             "modified": "2026-08-13T12:00:00Z",
             "tags": [],
+            "original_file_name": "statement.pdf",
+            "archived_file_name": "statement-archive.pdf",
+            "versions": [{"id": 92, "version_label": None, "is_root": True, "checksum": "source"}],
         }
         self.patches: list[dict] = []
+        self.version_patches: list[tuple[int | None, dict]] = []
+        self.version_labels: list[tuple[int, str]] = []
+        self.uploads: list[dict] = []
+        self.version_contents = {92: self.document["content"]}
 
     async def download_document(self, document_id: int, destination: Path) -> str:
         assert document_id == 92
@@ -145,14 +188,60 @@ class OCRPreferencePaperless:
 
     async def get_document(self, document_id: int) -> dict:
         assert document_id == 92
-        return dict(self.document)
+        return {**self.document, "versions": [dict(item) for item in self.document["versions"]]}
 
-    async def update_document(self, document_id: int, patch: dict) -> dict:
+    async def update_document(
+        self, document_id: int, patch: dict, *, version_id: int | None = None
+    ) -> dict:
         assert document_id == 92
         self.patches.append(patch)
+        self.version_patches.append((version_id, patch))
+        if "content" in patch and version_id is not None:
+            self.version_contents[version_id] = patch["content"]
         self.document.update(patch)
         self.document["modified"] = "2026-08-13T12:01:00Z"
         return dict(self.document)
+
+    async def upload_document_version(
+        self,
+        document_id: int,
+        source: Path,
+        *,
+        filename: str,
+        version_label: str,
+    ) -> str:
+        assert document_id == 92
+        assert filename == "statement-archive.pdf"
+        self.uploads.append({"source": source.name, "version_label": version_label})
+        return "version-task-92"
+
+    async def wait_for_task(self, task_id: str, **_: object) -> dict:
+        assert task_id == "version-task-92"
+        if self.document["versions"][0]["id"] != 192:
+            self.document["versions"].insert(
+                0,
+                {
+                    "id": 192,
+                    "version_label": "Paperless Clerk OCR",
+                    "is_root": False,
+                    "checksum": "source",
+                },
+            )
+            self.version_contents[192] = "Paperless re-extracted text"
+            self.document["content"] = self.version_contents[192]
+            self.document["modified"] = "2026-08-13T12:00:30Z"
+        return {"status": "success", "result_data": {"document_id": 192}}
+
+    async def update_version_label(
+        self, document_id: int, version_id: int, version_label: str
+    ) -> dict:
+        assert document_id == 92
+        self.version_labels.append((version_id, version_label))
+        for version in self.document["versions"]:
+            if version["id"] == version_id:
+                version["version_label"] = version_label
+                return dict(version)
+        raise AssertionError("version not found")
 
     async def ensure_tag(self, name: str) -> dict:
         assert name == "ocr-conflict"
@@ -163,6 +252,7 @@ class OCRFooterPaperless(OCRPreferencePaperless):
     def __init__(self):
         super().__init__()
         self.document["content"] = FOOTER_BODY + FOOTER_TEXT
+        self.version_contents[92] = self.document["content"]
 
 
 class EmptyOCRPaperless(OCRPreferencePaperless):
@@ -323,7 +413,7 @@ async def test_metadata_write_retries_if_paperless_ocr_changed(
 
 
 @pytest.mark.asyncio
-async def test_ocr_verification_uses_latest_paperless_text_before_writing(
+async def test_ocr_publishing_backs_up_text_added_while_clerk_was_working(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "clerk.db")
@@ -332,9 +422,7 @@ async def test_ocr_verification_uses_latest_paperless_text_before_writing(
     paperless = OCRCorrectedDuringRunPaperless()
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
-    outcome, text, _, _, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=False)
-    )._process_ocr(  # noqa: SLF001
+    outcome, text, _, _, _ = await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
         job,
         {
             "id": 89,
@@ -348,24 +436,17 @@ async def test_ocr_verification_uses_latest_paperless_text_before_writing(
     )
 
     assert outcome and outcome.status == "completed"
-    assert (
-        text
-        == "Acme issued this detailed monthly statement with account totals and payment history."
-    )
-    assert paperless.patches == []
-    assert paperless.downloads == 2
+    assert text.startswith("--- Page 1 ---\nAcme issued this detailed monthly statement")
+    assert paperless.patches == [(189, {"content": text})]
+    assert paperless.version_labels == [(89, "Pre-Clerk OCR backup")]
+    assert paperless.uploads == 1
+    assert paperless.downloads == 3
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("prefer_clerk", "expected_source"),
-    [(True, "clerk"), (False, "paperless")],
-)
-async def test_trusted_ocr_match_uses_configured_source_preference(
+async def test_existing_ocr_always_becomes_a_backup_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    prefer_clerk: bool,
-    expected_source: str,
 ) -> None:
     db = Database(tmp_path / "clerk.db")
     db.initialize()
@@ -373,9 +454,7 @@ async def test_trusted_ocr_match_uses_configured_source_preference(
     paperless = OCRPreferencePaperless()
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
-    outcome, text, pages, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=prefer_clerk)
-    )._process_ocr(  # noqa: SLF001
+    outcome, text, pages, updated, _ = await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
         paperless,  # type: ignore[arg-type]
@@ -386,26 +465,143 @@ async def test_trusted_ocr_match_uses_configured_source_preference(
         "--- Page 1 ---\n"
         "Acme issued this detailed monthly statement with account totals and payment history\n"
     )
-    existing = (
-        "Acme issued this detailed monthly statement with account totals and payment history."
-    )
     assert outcome and outcome.status == "completed"
-    assert text == (generated if prefer_clerk else existing)
-    assert pages == (
-        [(1, "Acme issued this detailed monthly statement with account totals and payment history")]
-        if prefer_clerk
-        else [(1, existing)]
-    )
-    assert paperless.patches == ([{"content": generated}] if prefer_clerk else [])
-    assert updated["content"] == (generated if prefer_clerk else existing)
+    assert text == generated
+    assert pages == [
+        (1, "Acme issued this detailed monthly statement with account totals and payment history")
+    ]
+    assert paperless.patches == [{"content": generated}]
+    assert paperless.version_patches == [(192, {"content": generated})]
+    assert paperless.version_contents[92].endswith("payment history.")
+    assert paperless.version_contents[192] == generated
+    assert paperless.version_labels == [(92, "Pre-Clerk OCR backup")]
+    assert paperless.uploads == [{"source": "document", "version_label": "Paperless Clerk OCR"}]
+    assert updated["content"] == generated
     events = db.get_job(job["id"], include_events=True)["events"]
-    comparison = next(event for event in events if event["event_type"] == "ocr_compared")
-    assert comparison["data"]["selected_source"] == expected_source
-    assert ("ocr_preference_applied" in {event["event_type"] for event in events}) is prefer_clerk
+    assert "ocr_version_queued" in {event["event_type"] for event in events}
+    assert "ocr_version_published" in {event["event_type"] for event in events}
+    checkpoint = db.get_job(job["id"])
+    assert checkpoint["ocr_version_task_id"] == "version-task-92"
+    assert checkpoint["ocr_version_id"] == 192
 
 
 @pytest.mark.asyncio
-async def test_deepseek_match_can_publish_preferred_clerk_ocr(
+async def test_existing_clerk_version_is_reused_without_another_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = OCRPreferencePaperless()
+    paperless.document["versions"].insert(
+        0,
+        {
+            "id": 192,
+            "version_label": "Paperless Clerk OCR",
+            "is_root": False,
+            "checksum": "source",
+        },
+    )
+    paperless.version_contents[192] = paperless.document["content"]
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, _, _ = await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert paperless.uploads == []
+    assert paperless.version_labels == []
+    assert paperless.version_patches == [(192, {"content": text})]
+
+
+@pytest.mark.asyncio
+async def test_pending_version_task_is_resumed_without_another_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    queued, _ = db.enqueue_job(92, "ocr", 3)
+    db.set_ocr_version_task(queued["id"], "version-task-92")
+    job = db.get_job(queued["id"])
+    assert job is not None
+    paperless = OCRPreferencePaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert paperless.uploads == []
+    assert db.get_job(job["id"])["ocr_version_id"] == 192
+
+
+@pytest.mark.asyncio
+async def test_interrupted_version_upload_is_not_repeated_while_outcome_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    queued, _ = db.enqueue_job(92, "ocr", 3)
+    db.set_ocr_version_task(queued["id"], processing.VERSION_UPLOAD_STARTED)
+    job = db.get_job(queued["id"])
+    assert job is not None
+    paperless = OCRPreferencePaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    with pytest.raises(ProcessingError, match="Inspect the document's version history") as raised:
+        await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
+            job,
+            dict(paperless.document),
+            paperless,  # type: ignore[arg-type]
+            NearMatchingOCRModel(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "ocr_version_upload_ambiguous"
+    assert paperless.uploads == []
+    assert db.get_job(job["id"])["ocr_version_task_id"] == processing.VERSION_UPLOAD_STARTED
+
+
+@pytest.mark.asyncio
+async def test_failed_paperless_version_task_clears_checkpoint_for_manual_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailedVersionPaperless(OCRPreferencePaperless):
+        async def wait_for_task(self, task_id: str, **_: object) -> dict:
+            assert task_id == "version-task-92"
+            return {
+                "status": "failure",
+                "result_data": {"error_message": "consumer rejected the file"},
+            }
+
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3)
+    paperless = FailedVersionPaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    with pytest.raises(ProcessingError, match="consumer rejected") as raised:
+        await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
+            job,
+            dict(paperless.document),
+            paperless,  # type: ignore[arg-type]
+            NearMatchingOCRModel(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == "ocr_version_failed"
+    checkpoint = db.get_job(job["id"])
+    assert checkpoint and checkpoint["ocr_version_task_id"] is None
+    assert checkpoint["ocr_version_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_deepseek_can_publish_versioned_clerk_ocr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vllm_profiles: None
 ) -> None:
     db = Database(tmp_path / "clerk.db")
@@ -415,7 +611,7 @@ async def test_deepseek_match_can_publish_preferred_clerk_ocr(
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
     outcome, text, _, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+        db, Settings(ocr_profile="deepseek_ocr")
     )._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
@@ -432,9 +628,7 @@ async def test_deepseek_match_can_publish_preferred_clerk_ocr(
     assert updated["content"] == generated
     assert paperless.patches == [{"content": generated}]
     events = db.get_job(job["id"], include_events=True)["events"]
-    comparison = next(event for event in events if event["event_type"] == "ocr_compared")
-    assert comparison["data"]["selected_source"] == "clerk"
-    assert "ocr_preference_applied" in {event["event_type"] for event in events}
+    assert "ocr_version_published" in {event["event_type"] for event in events}
 
 
 @pytest.mark.asyncio
@@ -449,7 +643,7 @@ async def test_specialist_ocr_without_baseline_publishes(
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
     outcome, text, _, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=True, ocr_profile=profile)
+        db, Settings(ocr_profile=profile)
     )._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
@@ -498,7 +692,7 @@ async def test_ordinary_ocr_without_baseline_still_publishes(
 
 
 @pytest.mark.asyncio
-async def test_shorter_clerk_ocr_never_overwrites_an_existing_footer(
+async def test_shorter_clerk_ocr_becomes_default_while_footer_version_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vllm_profiles: None
 ) -> None:
     db = Database(tmp_path / "clerk.db")
@@ -509,7 +703,7 @@ async def test_shorter_clerk_ocr_never_overwrites_an_existing_footer(
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
     outcome, text, _, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=True, ocr_profile="deepseek_ocr")
+        db, Settings(ocr_profile="deepseek_ocr")
     )._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
@@ -518,13 +712,12 @@ async def test_shorter_clerk_ocr_never_overwrites_an_existing_footer(
     )
 
     assert outcome and outcome.status == "completed"
-    assert text == original
-    assert updated["content"] == original
-    assert paperless.patches == []
+    assert text != original
+    assert updated["content"] == text
+    assert paperless.patches == [{"content": text}]
+    assert paperless.version_contents[92] == original
+    assert paperless.version_contents[192] == text
     events = db.get_job(job["id"], include_events=True)["events"]
-    comparison = next(event for event in events if event["event_type"] == "ocr_compared")
-    assert comparison["data"]["selected_source"] == "paperless"
-    assert comparison["data"]["generated_tokens"] < comparison["data"]["existing_tokens"]
     configuration = next(event for event in events if event["event_type"] == "ocr_configuration")
     assert configuration["data"]["model"] == "qwen2.5vl:7b"
     assert configuration["data"]["profile"] == "deepseek_ocr"
@@ -533,7 +726,7 @@ async def test_shorter_clerk_ocr_never_overwrites_an_existing_footer(
 
 
 @pytest.mark.asyncio
-async def test_clerk_preference_never_bypasses_low_match_review(
+async def test_divergent_existing_ocr_is_backed_up_without_intervention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "clerk.db")
@@ -543,23 +736,16 @@ async def test_clerk_preference_never_bypasses_low_match_review(
     original = paperless.document["content"]
     monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
 
-    outcome, text, _, updated, _ = await DocumentProcessor(
-        db, Settings(prefer_clerk_ocr=True)
-    )._process_ocr(  # noqa: SLF001
+    outcome, text, _, updated, _ = await DocumentProcessor(db, Settings())._process_ocr(  # noqa: SLF001
         job,
         dict(paperless.document),
         paperless,  # type: ignore[arg-type]
         DivergentOCRModel(),  # type: ignore[arg-type]
     )
 
-    assert outcome and outcome.status == "needs_review"
-    assert outcome.phase == "ocr_conflict"
-    assert text == original
-    assert paperless.patches == [{"tags": [99]}]
-    assert updated["content"] == original
-    comparison = next(
-        event
-        for event in db.get_job(job["id"], include_events=True)["events"]
-        if event["event_type"] == "ocr_compared"
-    )
-    assert comparison["data"]["selected_source"] == "manual_review"
+    assert outcome and outcome.status == "completed"
+    assert outcome.phase == "complete"
+    assert text.startswith("--- Page 1 ---\nNorthwind provided")
+    assert updated["content"] == text
+    assert paperless.version_contents[92] == original
+    assert db.list_conflicts() == []

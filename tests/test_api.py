@@ -46,7 +46,8 @@ async def test_production_lifespan_serves_health_ui_and_assets(
     assert script.status_code == 200
     assert "renderOverview" in script.text
     assert "ocr_profile_choices" in script.text
-    assert "Prefer Clerk OCR after a trusted match" in script.text
+    assert "Existing Paperless OCR is retained as a backup file version" in script.text
+    assert "Prefer Clerk OCR after a trusted match" not in script.text
     assert "OCR review versions" in script.text
     assert "Paperless had no OCR baseline" in script.text
     assert "Both complete OCR versions" not in script.text
@@ -101,7 +102,6 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
         "generic",
         "deepseek_ocr_llamacpp",
     ]
-    assert settings.json()["prefer_clerk_ocr"] is True
     assert settings.json()["log_level"] == "INFO"
     assert "ocr_base_url" not in settings.json()
     assert "metadata_base_url" not in settings.json()

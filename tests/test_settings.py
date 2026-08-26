@@ -36,7 +36,6 @@ def test_ocr_profile_defaults_to_generic_and_accepts_specialists() -> None:
     assert Settings(ocr_profile="deepseek_ocr").ocr_profile == "deepseek_ocr"
     assert Settings(ocr_profile="deepseek_ocr_llamacpp").ocr_profile == "deepseek_ocr_llamacpp"
     assert Settings(ocr_profile="glm_ocr").ocr_profile == "glm_ocr"
-    assert Settings().prefer_clerk_ocr is True
     with pytest.raises(ValueError, match="ocr_profile"):
         Settings(ocr_profile="some-other-model")
 
@@ -148,11 +147,6 @@ def test_legacy_model_urls_migrate_to_one_shared_url() -> None:
     assert "metadata_base_url" not in settings.persisted_dict()
     assert "ocr_api_key" not in settings.persisted_dict()
     assert "metadata_api_key" not in settings.persisted_dict()
-
-
-def test_watch_tag_must_differ_from_conflict_tag() -> None:
-    with pytest.raises(ValueError, match="must differ"):
-        Settings(automation_tag="OCR-Conflict", conflict_tag="ocr-conflict")
 
 
 def test_ntfy_settings_require_a_valid_topic_and_keep_token_private() -> None:

@@ -27,7 +27,6 @@ class Settings(BaseModel):
     openai_api_key: SecretStr = SecretStr("")
     ocr_model: str = "qwen2.5vl:7b"
     ocr_profile: str = "generic"
-    prefer_clerk_ocr: bool = True
     # No OCR context setting: one page image plus a short command is the whole
     # request, so the server's own context is the only limit that matters and
     # it already clamps an oversized output request.
@@ -50,8 +49,6 @@ class Settings(BaseModel):
     max_image_pixels: int = Field(default=16_000_000, ge=1_000_000, le=80_000_000)
     jpeg_quality: int = Field(default=86, ge=45, le=95)
     ocr_min_chars: int = Field(default=24, ge=1, le=1000)
-    ocr_similarity_threshold: float = Field(default=0.82, ge=0.5, le=0.99)
-    conflict_tag: str = Field(default="ocr-conflict", min_length=1, max_length=100)
 
     metadata_chunk_chars: int = Field(default=12_000, ge=2_000, le=100_000)
     metadata_candidate_limit: int = Field(default=80, ge=10, le=500)
@@ -94,7 +91,7 @@ class Settings(BaseModel):
             raise ValueError(f"must be one of: {', '.join(PROFILE_KEYS)}")
         return value
 
-    @field_validator("conflict_tag", "automation_tag")
+    @field_validator("automation_tag")
     @classmethod
     def normalize_tag(cls, value: str) -> str:
         return " ".join(value.split())
@@ -114,8 +111,6 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def keep_chunks_inside_context(self) -> Settings:
-        if self.automation_tag and self.automation_tag.casefold() == self.conflict_tag.casefold():
-            raise ValueError("automation watch tag must differ from the OCR conflict tag")
         if self.notifications_enabled and not self.ntfy_topic:
             raise ValueError("an ntfy topic is required when notifications are enabled")
         if self.metadata_max_output_tokens >= self.metadata_context_tokens:
@@ -174,7 +169,6 @@ ENVIRONMENT_FIELDS = {
     "CLERK_OPENAI_API_KEY": "openai_api_key",
     "CLERK_OCR_MODEL": "ocr_model",
     "CLERK_OCR_PROFILE": "ocr_profile",
-    "CLERK_PREFER_CLERK_OCR": "prefer_clerk_ocr",
     "CLERK_OCR_MAX_OUTPUT_TOKENS": "ocr_max_output_tokens",
     "CLERK_METADATA_MODEL": "metadata_model",
     "CLERK_METADATA_CONTEXT_TOKENS": "metadata_context_tokens",
@@ -189,8 +183,6 @@ ENVIRONMENT_FIELDS = {
     "CLERK_MAX_IMAGE_PIXELS": "max_image_pixels",
     "CLERK_JPEG_QUALITY": "jpeg_quality",
     "CLERK_OCR_MIN_CHARS": "ocr_min_chars",
-    "CLERK_OCR_SIMILARITY_THRESHOLD": "ocr_similarity_threshold",
-    "CLERK_CONFLICT_TAG": "conflict_tag",
     "CLERK_METADATA_CHUNK_CHARS": "metadata_chunk_chars",
     "CLERK_METADATA_CANDIDATE_LIMIT": "metadata_candidate_limit",
     "CLERK_METADATA_MIN_CONFIDENCE": "metadata_min_confidence",

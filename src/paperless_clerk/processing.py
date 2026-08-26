@@ -18,16 +18,33 @@ from paperless_clerk.clients.paperless import PaperlessClient, PaperlessError
 from paperless_clerk.config import Settings, SettingsManager
 from paperless_clerk.db import Database
 from paperless_clerk.domain.chunking import pages_from_assembled_text
-from paperless_clerk.domain.ocr_compare import assemble_pages, compare_ocr, meaningful_ocr
+from paperless_clerk.domain.ocr_compare import assemble_pages, meaningful_ocr
 from paperless_clerk.metadata import MetadataAnalyzer, MetadataPlanner, apply_metadata_plan
 from paperless_clerk.ocr_profiles import ocr_profile
 from paperless_clerk.rendering import DocumentRenderer, RenderError
 
 log = logging.getLogger(__name__)
 
+CLERK_VERSION_LABEL = "Paperless Clerk OCR"
+PRE_CLERK_VERSION_LABEL = "Pre-Clerk OCR backup"
+VERSION_UPLOAD_STARTED = "__paperless_clerk_version_upload_started__"
+
 
 def _normalized_tag_name(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
+
+
+def _latest_version(document: dict[str, Any]) -> dict[str, Any] | None:
+    versions = document.get("versions")
+    if isinstance(versions, list) and versions and isinstance(versions[0], dict):
+        return versions[0]
+    return None
+
+
+def _download_filename(document: dict[str, Any]) -> str:
+    candidate = document.get("archived_file_name") or document.get("original_file_name")
+    filename = Path(str(candidate or "")).name
+    return filename or f"document-{int(document['id'])}"
 
 
 def _watch_tag_from_catalog(
@@ -218,11 +235,16 @@ class DocumentProcessor:
                 request_configuration,
             )
         self.database.update_job(job["id"], ocr_fingerprint=fingerprint)
+        version_task_id = str(job.get("ocr_version_task_id") or "") or None
+        version_id = int(job["ocr_version_id"]) if job.get("ocr_version_id") else None
         with tempfile.TemporaryDirectory(prefix="paperless-clerk-") as temp_directory:
             path = Path(temp_directory) / "document"
             source_hash = await paperless.download_document(int(document["id"]), path)
             if job.get("source_hash") and job["source_hash"] != source_hash:
                 self.database.clear_pages(job["id"])
+                self.database.clear_ocr_version_checkpoint(job["id"])
+                version_task_id = None
+                version_id = None
                 self.database.add_event(
                     job["id"],
                     "warning",
@@ -299,81 +321,163 @@ class DocumentProcessor:
                 )
             return None, generated, pages, updated, source_hash
 
-        self.database.update_job(job["id"], phase="verifying_ocr")
-        comparison = compare_ocr(existing, generated, self.settings.ocr_similarity_threshold)
-        # Similarity is symmetric; replacing the system of record is not. Two
-        # transcriptions can agree everywhere they overlap while the new one is
-        # simply missing a block, so never overwrite Paperless with a shorter
-        # result. Both versions stay in job diagnostics either way.
-        use_clerk = (
-            comparison.is_similar
-            and self.settings.prefer_clerk_ocr
-            and comparison.generated_tokens >= 0.98 * comparison.existing_tokens
+        # Existing OCR belongs to the current file version. Preserve that
+        # version, upload the same file as a new latest version, and publish
+        # Clerk OCR only to the new version. A static label makes later Clerk
+        # runs idempotent while the task/version IDs make interrupted uploads
+        # recoverable without creating duplicates.
+        current_version = _latest_version(document)
+        current_version_id = int(current_version["id"]) if current_version else None
+        current_is_clerk = bool(
+            current_version
+            and str(current_version.get("version_label") or "") == CLERK_VERSION_LABEL
         )
-        selected_source = (
-            "clerk" if use_clerk else "paperless" if comparison.is_similar else "manual_review"
+        known_versions = {
+            int(item["id"])
+            for item in document.get("versions", [])
+            if isinstance(item, dict) and item.get("id") is not None
+        }
+        if version_id is not None and version_id not in known_versions:
+            self.database.clear_ocr_version_checkpoint(job["id"])
+            version_task_id = None
+            version_id = None
+
+        backup_version = current_version if not current_is_clerk else None
+        if version_id is not None:
+            if current_version_id != version_id:
+                raise ProcessingError(
+                    "source_changed",
+                    "A newer Paperless version appeared before Clerk OCR was published; "
+                    "retrying against the new latest version",
+                    retryable=True,
+                )
+        elif current_is_clerk and current_version_id is not None:
+            version_id = current_version_id
+            self.database.complete_ocr_version(job["id"], version_id)
+            backup_version = None
+        else:
+            self.database.update_job(job["id"], phase="creating_ocr_version")
+            if version_task_id == VERSION_UPLOAD_STARTED:
+                raise ProcessingError(
+                    "ocr_version_upload_ambiguous",
+                    "A prior Paperless version upload was interrupted before Clerk recorded its "
+                    "task ID. Inspect the document's version history before retrying so Clerk "
+                    "cannot create a duplicate backup.",
+                )
+            if version_task_id is None:
+                with tempfile.TemporaryDirectory(
+                    prefix="paperless-clerk-version-"
+                ) as version_directory:
+                    version_path = Path(version_directory) / "document"
+                    version_hash = await paperless.download_document(
+                        int(document["id"]), version_path
+                    )
+                    if version_hash != source_hash:
+                        raise ProcessingError(
+                            "source_changed",
+                            "The Paperless source file changed before Clerk could create its "
+                            "OCR version; retrying the new version",
+                            retryable=True,
+                        )
+                    self.database.set_ocr_version_task(job["id"], VERSION_UPLOAD_STARTED)
+                    try:
+                        version_task_id = await paperless.upload_document_version(
+                            int(document["id"]),
+                            version_path,
+                            filename=_download_filename(document),
+                            version_label=CLERK_VERSION_LABEL,
+                        )
+                    except PaperlessError as exc:
+                        if not exc.ambiguous:
+                            self.database.clear_ocr_version_checkpoint(job["id"])
+                        raise
+                self.database.set_ocr_version_task(job["id"], version_task_id)
+                self.database.add_event(
+                    job["id"],
+                    "info",
+                    "ocr_version_queued",
+                    "Queued a new Paperless file version for Clerk OCR",
+                    {"paperless_task_id": version_task_id},
+                )
+
+            task = await paperless.wait_for_task(
+                version_task_id,
+                timeout_seconds=self.settings.request_timeout_seconds,
+            )
+            task_status = str(task.get("status") or "").casefold()
+            result_data = (
+                task.get("result_data") if isinstance(task.get("result_data"), dict) else {}
+            )
+            if task_status != "success":
+                self.database.clear_ocr_version_checkpoint(job["id"])
+                detail = (
+                    result_data.get("error_message")
+                    or result_data.get("reason")
+                    or f"task ended with status {task_status or 'unknown'}"
+                )
+                raise ProcessingError(
+                    "ocr_version_failed",
+                    f"Paperless could not create the Clerk OCR version: {detail}",
+                )
+            created_id = result_data.get("document_id")
+            if not isinstance(created_id, int):
+                raise ProcessingError(
+                    "ocr_version_invalid",
+                    "Paperless completed the version task without returning the created version ID",
+                )
+            version_id = created_id
+            self.database.complete_ocr_version(job["id"], version_id)
+            document = await paperless.get_document(int(document["id"]))
+            latest = _latest_version(document)
+            if not latest or int(latest["id"]) != version_id:
+                raise ProcessingError(
+                    "source_changed",
+                    "A newer Paperless version appeared while Clerk's version was being created; "
+                    "retrying against the new latest version",
+                    retryable=True,
+                )
+
+        if backup_version and not backup_version.get("version_label"):
+            try:
+                await paperless.update_version_label(
+                    int(document["id"]), int(backup_version["id"]), PRE_CLERK_VERSION_LABEL
+                )
+            except PaperlessError as exc:
+                self.database.add_event(
+                    job["id"],
+                    "warning",
+                    "ocr_backup_label_failed",
+                    f"The original version was preserved but its backup label could not be set: {exc}",
+                )
+
+        self.database.update_job(job["id"], phase="publishing_ocr")
+        await paperless.update_document(
+            int(document["id"]), {"content": generated}, version_id=version_id
         )
+        updated = await paperless.get_document(int(document["id"]))
+        published_version = _latest_version(updated)
+        if not published_version or int(published_version["id"]) != version_id:
+            raise ProcessingError(
+                "source_changed",
+                "A newer Paperless version appeared while Clerk OCR was being published; "
+                "retrying against the new latest version",
+                retryable=True,
+            )
+        if str(updated.get("content") or "") != generated:
+            raise ProcessingError(
+                "ocr_publish_failed",
+                "Paperless did not return Clerk OCR as the latest version content",
+            )
         self.database.add_event(
             job["id"],
-            "info" if comparison.is_similar else "warning",
-            "ocr_compared",
-            f"OCR comparison score {comparison.score:.3f}; selected {selected_source.replace('_', ' ')}",
-            {**comparison.metrics(), "selected_source": selected_source},
+            "info",
+            "ocr_version_published",
+            "Published Clerk OCR as the latest Paperless version and retained the prior version",
+            {"version_id": version_id, "pages": len(pages)},
         )
-        if comparison.is_similar:
-            selected_text = existing
-            selected_pages = pages_from_assembled_text(existing)
-            if use_clerk:
-                selected_text = generated
-                selected_pages = pages
-                if generated != existing:
-                    self.database.update_job(job["id"], phase="publishing_ocr")
-                    document = await paperless.update_document(
-                        int(document["id"]), {"content": generated}
-                    )
-                    self.database.add_event(
-                        job["id"],
-                        "info",
-                        "ocr_preference_applied",
-                        "Replaced existing Paperless OCR with Clerk OCR after a trusted match",
-                        {"score": comparison.score, "selected_source": "clerk"},
-                    )
-            if job["mode"] == "ocr":
-                return (
-                    ProcessOutcome("completed", "complete"),
-                    selected_text,
-                    selected_pages,
-                    document,
-                    source_hash,
-                )
-            return None, selected_text, selected_pages, document, source_hash
-
-        conflict_tag = await paperless.ensure_tag(self.settings.conflict_tag)
-        tag_ids = {int(value) for value in document.get("tags", [])}
-        tag_ids.add(int(conflict_tag["id"]))
-        updated = await paperless.update_document(int(document["id"]), {"tags": sorted(tag_ids)})
-        self.database.create_conflict(
-            job_id=job["id"],
-            document_id=int(document["id"]),
-            document_title=str(document.get("title") or ""),
-            existing_text=existing,
-            generated_text=generated,
-            score=comparison.score,
-            metrics=comparison.metrics(),
-            diff=comparison.mismatch_snippets,
-            tag_id=int(conflict_tag["id"]),
-        )
-        return (
-            ProcessOutcome(
-                "needs_review",
-                "ocr_conflict",
-                "Existing and Clerk OCR differ; review is required before metadata analysis",
-            ),
-            existing,
-            pages,
-            updated,
-            source_hash,
-        )
+        if job["mode"] == "ocr":
+            return ProcessOutcome("completed", "complete"), generated, pages, updated, source_hash
+        return None, generated, pages, updated, source_hash
 
     async def _ocr_pages(
         self,

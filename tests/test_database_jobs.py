@@ -79,6 +79,24 @@ def test_completed_pages_survive_retry(tmp_path: Path) -> None:
     ]
 
 
+def test_ocr_version_checkpoint_survives_claims_and_can_be_cleared(tmp_path: Path) -> None:
+    db = database(tmp_path)
+    job, _ = db.enqueue_job(107, "ocr", 3)
+
+    db.set_ocr_version_task(job["id"], "paperless-task")
+    db.complete_ocr_version(job["id"], 207)
+
+    checkpoint = db.get_job(job["id"])
+    assert checkpoint and checkpoint["ocr_version_task_id"] == "paperless-task"
+    assert checkpoint["ocr_version_id"] == 207
+
+    db.clear_ocr_version_checkpoint(job["id"])
+
+    cleared = db.get_job(job["id"])
+    assert cleared and cleared["ocr_version_task_id"] is None
+    assert cleared["ocr_version_id"] is None
+
+
 def test_ocr_conflict_is_not_double_counted_as_generic_review(tmp_path: Path) -> None:
     db = database(tmp_path)
     job, _ = db.enqueue_job(105, "full", 3)

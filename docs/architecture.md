@@ -21,11 +21,19 @@ Paperless-ngx's current API supports the operations Clerk needs:
   original with `?original=true`).
 - `PATCH /api/documents/{id}/` accepts `content`, canonical metadata IDs,
   `created`, and custom-field instances shaped as `{field, value}`.
+- `POST /api/documents/{id}/update_version/` consumes an uploaded file as a new
+  version and returns a Paperless task UUID.
+- `GET /api/tasks/?task_id={uuid}` exposes completion and the created version ID;
+  `PATCH /api/documents/{id}/?version={version_id}` targets that version's text.
+- `PATCH /api/documents/{id}/versions/{version_id}/` labels a retained version.
 - Tags, correspondents, document types, and custom fields are paginated API
   resources and can be created independently.
 
-Clerk updates OCR text through the document `content` field. It does not upload
-a replacement PDF, delete originals, or attempt to reproduce Paperless storage.
+Clerk updates OCR text through the version-specific `content` field. When a
+baseline exists it uploads the unchanged current file to let Paperless create a
+new version; it never deletes or rewrites the prior version and does not attempt
+to reproduce Paperless storage itself. This contract requires Paperless-ngx 3.0
+or newer.
 
 ## Components
 
@@ -59,24 +67,26 @@ crashed worker can resume work after restart.
    sibling pages. A job with exhausted pages becomes an intervention rather
    than publishing incomplete OCR.
 6. Successful page text is assembled with stable page markers.
-7. Re-fetch the Paperless document before publishing or comparing. If Paperless
-   changed during inference, recheck the source hash; a changed source retries
-   from its new pages, while a user-corrected OCR becomes the current comparison
-   input. If there is still no meaningful content, Clerk patches the complete
-   assembled OCR. Otherwise, a linear-time comparison combines
-   token multiset overlap, vocabulary overlap, ordered shingles, length
-   agreement, and numeric-token agreement.
-8. Similar OCR selects Clerk or the existing Paperless content according to the
-   configured source preference. Clerk OCR is never published over a longer
-   existing transcription, because agreement across the overlap does not prove
-   the new reading is complete. Divergent OCR creates a durable conflict
-   containing both versions and comparison evidence, adds the `ocr-conflict`
-   tag, and stops before metadata classification.
-9. Conflict resolution re-fetches the live Paperless document. Keeping
-   Paperless requires meaningful current OCR. Choosing Clerk is rejected if
-   Paperless OCR changed after the review was created, so a later human edit is
-   never overwritten. Only a successful resolution removes Clerk's conflict
-   tag and enqueues metadata-only processing.
+7. Re-fetch the Paperless document before publishing. If Paperless changed
+   during inference, recheck the source hash; a changed source retries from its
+   new pages. If there is still no meaningful content, Clerk patches the
+   complete assembled OCR onto the current version.
+8. If meaningful content exists, upload the unchanged current file through the
+   version endpoint with label `Paperless Clerk OCR`. Record an upload-started
+   checkpoint before the POST, persist the returned task UUID before polling it,
+   then persist the created version ID. A timeout or restart resumes that same
+   Paperless task rather than uploading again. If the POST response is lost
+   before its task UUID can be recorded, Clerk will reuse a completed
+   Clerk-labeled version if it appears but will not issue a blind duplicate
+   upload while the outcome remains ambiguous.
+9. If the prior version had no label, label it `Pre-Clerk OCR backup`. Patch the
+   complete Clerk text with an explicit `?version={version_id}` target and verify
+   that the created version is still latest. Paperless therefore uses Clerk OCR
+   for search and content by default while the earlier file/text remains
+   selectable in version history.
+10. A later run recognizes the latest `Paperless Clerk OCR` label and updates
+   that version rather than creating a new backup. A genuinely newer user/file
+   version causes a source retry and receives its own backup on the next pass.
 
 Reclaimed jobs reuse successful page rows from the same run. Paperless writes
 occur only after all required model work and validation has succeeded.
@@ -133,6 +143,11 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 - Whole-job retries have persisted attempt counts and due times.
 - Stale worker leases are reclaimed on startup and during polling.
 - An active-job uniqueness constraint prevents duplicate manual/poller jobs.
+- Paperless version task UUIDs and created version IDs survive Clerk restarts;
+  terminal Paperless failures clear the checkpoint so an explicit retry can
+  start a new upload, while timeouts retain it for safe resumption. A lost
+  upload response remains a deliberate intervention because Paperless provides
+  no task ID with which Clerk could safely deduplicate another POST.
 - OCR conflict resolutions use an atomic claim, preventing opposing concurrent
   choices from both modifying Paperless. They also validate the live OCR before
   writing, so an empty keep choice or stale Clerk replacement leaves the review
@@ -145,9 +160,9 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 - Container logs expose lifecycle, counts, and concise validation errors. A
   full Decision detail can reveal bounded invalid-output previews on demand,
   but never retains the source OCR or request prompt in that diagnostic log.
-- No Paperless OCR is overwritten on partial OCR, model parse failure, or a
-  low-confidence comparison. Preferred-source replacement occurs only after a
-  trusted comparison.
+- No Paperless OCR is published on partial OCR or model failure. Existing OCR is
+  moved behind a new latest version only after the complete Clerk result passes
+  local validation; its prior version remains intact.
 
 ## UI information architecture
 

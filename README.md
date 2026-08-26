@@ -2,8 +2,9 @@
 
 Paperless Clerk is a focused local-AI sidecar for
 [Paperless-ngx](https://docs.paperless-ngx.com/). It reads documents page by
-page, verifies rather than blindly replaces existing OCR, and classifies each
-document against the metadata system already living in Paperless.
+page, retains existing OCR as a Paperless file-version backup, publishes Clerk
+OCR as the default version, and classifies each document against the metadata
+system already living in Paperless.
 
 Its filing rule is simple:
 
@@ -18,14 +19,11 @@ model can transcribe pages while a smaller text model handles classification.
 - OCRs every page independently with bounded concurrency and persisted page
   results.
 - Writes complete OCR into Paperless only after every page succeeds.
-- Compares Clerk OCR with existing Paperless OCR using token, vocabulary,
-  ordered-shingle, length, and numeric agreement.
-- Selects either Clerk or the existing Paperless OCR after a trusted match,
-  according to the configured preference.
-- Adds an `ocr-conflict` Paperless tag and retains both complete readings when
-  they disagree.
-- Lets the user resolve a conflict side by side and resumes metadata processing
-  only after that decision.
+- When meaningful OCR already exists, preserves its complete file and text as a
+  `Pre-Clerk OCR backup` version and creates a latest `Paperless Clerk OCR`
+  version containing Clerk's text.
+- Persists and polls Paperless's asynchronous version task so retries resume the
+  same upload instead of creating another version.
 - Classifies correspondents, document types, tags, titles, intrinsic dates, and
   existing custom-field values with structured model outputs.
 - Retrieves the live Paperless vocabulary before every metadata run, validates
@@ -38,8 +36,9 @@ model can transcribe pages while a smaller text model handles classification.
 - Offers a responsive local UI for status, intervention, decisions, connection
   settings, and manual processing.
 
-Clerk does not replace Paperless storage, upload rewritten PDFs, provide chat or
+Clerk does not replace Paperless storage, rewrite source files, provide chat or
 RAG, connect to hosted AI services, or mirror the Paperless document library.
+The version workflow requires Paperless-ngx 3.0 or newer.
 
 ## Quick start with Docker Compose
 
@@ -84,10 +83,13 @@ For a manual or discovered document:
    images while local OCR calls run.
 3. Completed pages are committed immediately to SQLite. A process restart or
    retry skips those pages if the source has not changed.
-4. If Paperless has no meaningful content, Clerk patches the complete OCR output.
-5. If content exists, Clerk compares the two complete readings. A high score
-   selects the configured preferred source (Clerk by default); a low score
-   creates an intervention without replacing either reading automatically.
+4. If Paperless has no meaningful content, Clerk patches the complete OCR output
+   on the current version.
+5. If content exists, Clerk uploads the unchanged current file as a new version,
+   waits for Paperless consumption to complete, labels the prior version as a
+   backup when it had no label, and patches Clerk OCR onto the explicit new
+   version. That version is latest, so Paperless search and content use it by
+   default while the original reading remains available in version history.
 6. Metadata text is split at page/paragraph boundaries. Map calls extract
    compact candidates; hierarchical reduce calls operate on those candidates,
    never on the whole source document.
@@ -415,7 +417,6 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
 | `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic` or `deepseek_ocr_llamacpp` (plus `deepseek_ocr` and `glm_ocr` when unhidden below) |
 | `CLERK_ENABLE_VLLM_PROFILES` | unset | Offer the held-back `deepseek_ocr` and `glm_ocr` profiles again |
-| `CLERK_PREFER_CLERK_OCR` | `true` | After a trusted OCR match, publish Clerk OCR instead of retaining existing Paperless OCR |
 | `CLERK_OCR_MAX_OUTPUT_TOKENS` | `4096` | Per-page OCR output cap; must fit the serving context alongside the page image |
 | `CLERK_METADATA_MODEL` | `qwen2.5:14b` | Metadata model name |
 | `CLERK_METADATA_CONTEXT_TOKENS` | `16384` | Metadata context budget |
@@ -430,8 +431,6 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_MAX_IMAGE_PIXELS` | `16000000` | Per-page pixel ceiling; DPI scales down to fit |
 | `CLERK_JPEG_QUALITY` | `86` | Rendered page JPEG quality |
 | `CLERK_OCR_MIN_CHARS` | `24` | Minimum meaningful existing OCR size |
-| `CLERK_OCR_SIMILARITY_THRESHOLD` | `0.82` | Score required to choose either OCR source automatically |
-| `CLERK_CONFLICT_TAG` | `ocr-conflict` | Paperless review tag |
 | `CLERK_METADATA_CHUNK_CHARS` | `12000` | Maximum map input text size |
 | `CLERK_METADATA_CANDIDATE_LIMIT` | `80` | Bounded entities of each type shown to a model |
 | `CLERK_METADATA_MIN_CONFIDENCE` | `0.68` | Minimum confidence accepted for an assignment |
@@ -487,20 +486,17 @@ because the model is not given an authoritative bounded set of document IDs;
 assign those links in Paperless. Creating field definitions is disabled by
 default and supports only safely typed definitions.
 
-## Conflict and correction workflow
+## Versions, corrections, and legacy conflicts
 
-An open OCR conflict retains the OCR snapshot available when the review was
-created, Clerk's generated text, and comparison metrics. The Paperless document
-receives the conflict tag but its OCR is not changed. Resolution always
-re-fetches the live document. In **Intervention**:
+The prior reading remains selectable in Paperless's document version history,
+so correction normally means choosing or editing a version in Paperless rather
+than blocking Clerk's job. Clerk never publishes partial, empty, or rejected
+model output; those remain genuine failures/interventions.
 
-- **Keep Paperless OCR** requires meaningful current Paperless OCR and closes
-  the conflict without changing `content`.
-- **Use Clerk OCR** replaces `content` with the assembled page text only when
-  Paperless OCR has not changed since the review was created.
+Databases upgraded from the older comparison workflow may still contain open OCR
+conflicts. The Intervention screen and conflict-resolution API remain available
+to finish those records, but new OCR jobs do not create comparison conflicts.
 
-Only a successful action removes Clerk's conflict tag and enqueues metadata-only
-analysis. An empty keep choice or stale Clerk choice leaves the review open.
 Recent metadata decisions show the exact patch, canonical entities reused, new
 entities created, near-duplicates normalized, and candidates withheld. The
 document opens directly in Paperless for correction, and metadata can be rerun
@@ -526,9 +522,8 @@ deliberately excludes full OCR text and model request prompts.
   ran long.
 - Page failures do not cancel successful sibling pages and never publish a
   partial document.
-- Paperless OCR is not replaced after a model parse error, partial page run, or
-  low-confidence comparison. The preferred-source option applies only after a
-  trusted match.
+- Paperless OCR is not replaced after a model parse error or partial page run.
+  The prior version is retained before a complete Clerk result becomes latest.
 - At the default `INFO` level, container logs include job lifecycle, metadata
   outcomes, tag-review counts, retries, and concise validation failures. They
   never include document contents or model prompts. Clerk installs its own

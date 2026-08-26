@@ -12,10 +12,18 @@ from paperless_clerk.config import Settings
 
 
 class PaperlessError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = False, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+        ambiguous: bool = False,
+    ):
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.ambiguous = ambiguous
 
 
 class PaperlessClient:
@@ -88,8 +96,108 @@ class PaperlessClient:
         response = await self._request("GET", f"documents/{document_id}/")
         return response.json()
 
-    async def update_document(self, document_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-        response = await self._request("PATCH", f"documents/{document_id}/", json=payload)
+    async def update_document(
+        self,
+        document_id: int,
+        payload: dict[str, Any],
+        *,
+        version_id: int | None = None,
+    ) -> dict[str, Any]:
+        params = {"version": version_id} if version_id is not None else None
+        response = await self._request(
+            "PATCH", f"documents/{document_id}/", params=params, json=payload
+        )
+        return response.json()
+
+    async def upload_document_version(
+        self,
+        document_id: int,
+        source: Path,
+        *,
+        filename: str,
+        version_label: str,
+    ) -> str:
+        # A version upload queues Paperless consumption. Do not retry this POST:
+        # a lost response could otherwise create two versions of the same file.
+        try:
+            with source.open("rb") as stream:
+                response = await self._request(
+                    "POST",
+                    f"documents/{document_id}/update_version/",
+                    retry=False,
+                    files={"document": (filename, stream, "application/octet-stream")},
+                    data={"version_label": version_label},
+                )
+        except PaperlessError as exc:
+            if exc.retryable:
+                raise PaperlessError(
+                    "Paperless version upload had an ambiguous outcome. Clerk will not upload "
+                    "again automatically because Paperless may already be creating the version; "
+                    "inspect the document's version history before retrying.",
+                    ambiguous=True,
+                ) from exc
+            raise
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise PaperlessError(
+                "Paperless accepted the version upload but returned an invalid task response. "
+                "Clerk will not upload again automatically; inspect the document's version "
+                "history before retrying.",
+                ambiguous=True,
+            ) from exc
+        task_id = body.get("task_id") if isinstance(body, dict) else body
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise PaperlessError(
+                "Paperless accepted the version upload but did not return a task ID. Clerk "
+                "will not upload again automatically; inspect the document's version history "
+                "before retrying.",
+                ambiguous=True,
+            )
+        return task_id.strip()
+
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        response = await self._request(
+            "GET",
+            "tasks/",
+            params={"task_id": task_id, "page_size": 1},
+            headers={"Accept": "application/json; version=10"},
+        )
+        body = response.json()
+        tasks = body.get("results", []) if isinstance(body, dict) else body
+        if not isinstance(tasks, list):
+            raise PaperlessError("Paperless returned an invalid task-status response")
+        return tasks[0] if tasks and isinstance(tasks[0], dict) else None
+
+    async def wait_for_task(
+        self,
+        task_id: str,
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            task = await self.get_task(task_id)
+            status = str((task or {}).get("status") or "").casefold()
+            if status in {"success", "failure", "revoked"}:
+                return task or {}
+            if asyncio.get_running_loop().time() >= deadline:
+                raise PaperlessError(
+                    f"Paperless version task {task_id} did not finish within "
+                    f"{timeout_seconds:g} seconds",
+                    retryable=True,
+                )
+            await asyncio.sleep(poll_interval_seconds)
+
+    async def update_version_label(
+        self, document_id: int, version_id: int, version_label: str
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "PATCH",
+            f"documents/{document_id}/versions/{version_id}/",
+            json={"version_label": version_label},
+        )
         return response.json()
 
     async def download_document(self, document_id: int, destination: Path) -> str:

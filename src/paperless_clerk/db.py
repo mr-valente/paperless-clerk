@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_message TEXT,
     source_hash TEXT,
     ocr_fingerprint TEXT,
+    ocr_version_task_id TEXT,
+    ocr_version_id INTEGER,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     started_at REAL,
@@ -151,6 +153,10 @@ class Database:
             }
             if "ocr_fingerprint" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN ocr_fingerprint TEXT")
+            if "ocr_version_task_id" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN ocr_version_task_id TEXT")
+            if "ocr_version_id" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN ocr_version_id INTEGER")
             now = time.time()
             connection.execute(
                 "UPDATE jobs SET status='queued', phase='recovered', worker_id=NULL, "
@@ -279,6 +285,28 @@ class Database:
         values.append(job_id)
         with self.connect() as connection:
             connection.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id=?", values)
+
+    def set_ocr_version_task(self, job_id: str, task_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET ocr_version_task_id=?,updated_at=? WHERE id=?",
+                (task_id, time.time(), job_id),
+            )
+
+    def complete_ocr_version(self, job_id: str, version_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET ocr_version_id=?,updated_at=? WHERE id=?",
+                (version_id, time.time(), job_id),
+            )
+
+    def clear_ocr_version_checkpoint(self, job_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET ocr_version_task_id=NULL,ocr_version_id=NULL,updated_at=? "
+                "WHERE id=?",
+                (time.time(), job_id),
+            )
 
     def finish_job(self, job_id: str, status: str = "completed", phase: str = "complete") -> None:
         now = time.time()
