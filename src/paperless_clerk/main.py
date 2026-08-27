@@ -73,6 +73,9 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
     result.pop("force", None)
     for internal in ("source_hash", "ocr_fingerprint", "worker_id"):
         result.pop(internal, None)
+    # SQLite stores the per-job override as 0/1; NULL still means "follow the setting".
+    if result.get("keep_original_version") is not None:
+        result["keep_original_version"] = bool(result["keep_original_version"])
     for field in (
         "created_at",
         "updated_at",
@@ -235,6 +238,7 @@ async def enqueue_jobs(payload: EnqueueRequest, request: Request) -> dict[str, A
             document_id,
             payload.mode,
             settings.job_max_attempts,
+            keep_original_version=payload.keep_original_version,
         )
         jobs.append({"created": created, "job": _serialize_job(job)})
     request.app.state.job_manager.wake()

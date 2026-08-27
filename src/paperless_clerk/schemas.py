@@ -12,6 +12,8 @@ class StrictModel(BaseModel):
 class EnqueueRequest(BaseModel):
     document_ids: list[int] = Field(min_length=1, max_length=500)
     mode: Literal["full", "ocr", "metadata"] = "full"
+    # Per-job override of the app-wide setting; omitted means follow the setting.
+    keep_original_version: bool | None = None
 
     @model_validator(mode="after")
     def unique_positive_ids(self) -> EnqueueRequest:

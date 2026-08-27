@@ -301,14 +301,18 @@ class DocumentProcessor:
         document = live_document
         existing = str(document.get("content") or "")
         has_paperless_ocr = meaningful_ocr(existing, self.settings.ocr_min_chars)
+        # A job queued with an explicit choice keeps it across retries; the rest
+        # follow the app-wide setting as it stands right now.
+        job_preference = job.get("keep_original_version")
+        keep_original_version = (
+            self.settings.keep_original_version if job_preference is None else bool(job_preference)
+        )
         # Once a version upload has started, always finish or safely resume it;
-        # changing the setting mid-retry cannot undo a Paperless task that may
+        # changing the preference mid-retry cannot undo a Paperless task that may
         # already have created a version. Jobs without a version checkpoint
         # directly replace the latest version when retention is disabled.
         use_version_backup = has_paperless_ocr and (
-            self.settings.keep_original_version
-            or version_task_id is not None
-            or version_id is not None
+            keep_original_version or version_task_id is not None or version_id is not None
         )
         if not use_version_backup:
             self.database.update_job(job["id"], phase="publishing_ocr")

@@ -91,6 +91,15 @@
             <label><input type="radio" name="mode" value="metadata" /><span>Metadata only</span></label>
           </div>
         </div>
+        <div class="field" id="process-retention">
+          <span>Existing Paperless OCR</span>
+          <div class="segmented">
+            <label><input type="radio" name="keep_original_version" value="" checked /><span>Use setting</span></label>
+            <label><input type="radio" name="keep_original_version" value="keep" /><span>Keep as version</span></label>
+            <label><input type="radio" name="keep_original_version" value="replace" /><span>Replace in place</span></label>
+          </div>
+          <small id="process-retention-note">Applies only to documents that already have meaningful OCR.</small>
+        </div>
         <div class="dialog-actions">
           <button class="button ghost" type="button" data-action="close-process">Cancel</button>
           <button class="button primary" value="default" type="submit">Queue documents</button>

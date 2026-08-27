@@ -148,3 +148,54 @@ def test_decision_lists_expose_counts_not_evidence_details(tmp_path: Path) -> No
     }
     assert "sensitive excerpt" not in str(summary)
     assert detail and detail["decision_id"] == decision_id
+
+
+def test_per_job_ocr_retention_is_stored_and_defaults_to_the_setting(tmp_path: Path) -> None:
+    db = database(tmp_path)
+
+    following, _ = db.enqueue_job(108, "full", 3)
+    keeping, _ = db.enqueue_job(109, "full", 3, keep_original_version=True)
+    replacing, _ = db.enqueue_job(110, "ocr", 3, keep_original_version=False)
+
+    assert following["keep_original_version"] is None
+    assert keeping["keep_original_version"] == 1
+    assert replacing["keep_original_version"] == 0
+    # The choice is durable, so a retry cannot silently switch to the setting.
+    assert db.get_job(replacing["id"])["keep_original_version"] == 0
+
+
+def test_per_job_ocr_retention_is_recorded_in_the_enqueue_event(tmp_path: Path) -> None:
+    db = database(tmp_path)
+
+    keeping, _ = db.enqueue_job(111, "full", 3, keep_original_version=True)
+    replacing, _ = db.enqueue_job(112, "ocr", 3, keep_original_version=False)
+    following, _ = db.enqueue_job(113, "full", 3)
+    # Metadata jobs never publish OCR, so the choice would only mislead.
+    metadata_only, _ = db.enqueue_job(114, "metadata", 3, keep_original_version=True)
+
+    def enqueue_message(job_id: str) -> str:
+        events = db.get_job(job_id, include_events=True)["events"]
+        return next(event["message"] for event in events if event["event_type"] == "enqueued")
+
+    assert "keeping any existing OCR as a document version" in enqueue_message(keeping["id"])
+    assert "replacing any existing OCR in place" in enqueue_message(replacing["id"])
+    assert enqueue_message(following["id"]) == "Document 113 queued for full processing"
+    assert enqueue_message(metadata_only["id"]) == "Document 114 queued for metadata processing"
+
+
+def test_database_from_before_per_job_ocr_retention_is_migrated(tmp_path: Path) -> None:
+    db = database(tmp_path)
+    with db.connect() as connection:
+        connection.execute("ALTER TABLE jobs DROP COLUMN keep_original_version")
+        connection.execute(
+            "INSERT INTO jobs(id,document_id,mode,status,phase,next_run_at,created_at,updated_at) "
+            "VALUES('legacy',115,'full','queued','queued',?,?,?)",
+            (time.time(), time.time(), time.time()),
+        )
+
+    db.initialize()
+
+    legacy = db.get_job("legacy")
+    assert legacy and legacy["keep_original_version"] is None
+    migrated, _ = db.enqueue_job(116, "full", 3, keep_original_version=True)
+    assert migrated["keep_original_version"] == 1

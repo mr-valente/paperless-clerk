@@ -29,11 +29,13 @@ Paperless-ngx's current API supports the operations Clerk needs:
 - Tags, correspondents, document types, and custom fields are paginated API
   resources and can be created independently.
 
-Clerk updates OCR text through the `content` field. With
-`keep_original_version` enabled, a baseline causes it to upload the unchanged
-current file and target the new version's content; it never deletes or rewrites
-the prior version. With retention disabled, it targets the current version
-directly. The optional version contract requires Paperless-ngx 3.0 or newer.
+Clerk updates OCR text through the `content` field. With retention enabled, a
+baseline causes it to upload the unchanged current file and target the new
+version's content; it never deletes or rewrites the prior version. With
+retention disabled, it targets the current version directly. Retention comes
+from the `keep_original_version` setting unless the job carries its own
+`keep_original_version` value. The optional version contract requires
+Paperless-ngx 3.0 or newer.
 
 ## Components
 
@@ -71,16 +73,20 @@ crashed worker can resume work after restart.
    during inference, recheck the source hash; a changed source retries from its
    new pages. If there is still no meaningful content, Clerk patches the
    complete assembled OCR onto the current version.
-8. If meaningful content exists and `keep_original_version` is disabled, patch
-   the complete Clerk text directly onto the current latest version without an
-   upload. If retention is enabled, upload the unchanged current file through
-   the version endpoint with label `Paperless Clerk OCR`. Record an upload-started
-   checkpoint before the POST, persist the returned task UUID before polling it,
-   then persist the created version ID. A timeout or restart resumes that same
-   Paperless task rather than uploading again. If the POST response is lost
-   before its task UUID can be recorded, Clerk will reuse a completed
-   Clerk-labeled version if it appears but will not issue a blind duplicate
-   upload while the outcome remains ambiguous.
+8. Resolve retention from the job's own `keep_original_version` column when it
+   is not NULL, otherwise from the setting of that name as it stands right now.
+   A job queued with an explicit choice therefore keeps it across retries, and a
+   job without one follows the setting. If meaningful content exists and
+   retention is disabled, patch the complete Clerk text directly onto the
+   current latest version without an upload. If retention is enabled, upload the
+   unchanged current file through the version endpoint with label
+   `Paperless Clerk OCR`. Record an upload-started checkpoint before the POST,
+   persist the returned task UUID before polling it, then persist the created
+   version ID. A timeout or restart resumes that same Paperless task rather than
+   uploading again. If the POST response is lost before its task UUID can be
+   recorded, Clerk will reuse a completed Clerk-labeled version if it appears
+   but will not issue a blind duplicate upload while the outcome remains
+   ambiguous.
 9. If the prior version had no label, label it `Pre-Clerk OCR backup`. Patch the
    complete Clerk text with an explicit `?version={version_id}` target and verify
    that the created version is still latest. Paperless therefore uses Clerk OCR
@@ -165,7 +171,7 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 - No Paperless OCR is published on partial OCR or model failure. Only after the
   complete Clerk result passes local validation is existing OCR either moved
   behind a new latest version or replaced on the current version, according to
-  `keep_original_version`.
+  the job's own retention choice or, absent one, `keep_original_version`.
 
 ## UI information architecture
 
@@ -174,8 +180,10 @@ decisions, and settings. The intervention queue unifies OCR conflicts and
 exhausted jobs while retaining distinct actions. Conflict detail is loaded only
 on demand and presents both texts, scores, and mismatch excerpts. Decision
 detail includes an on-demand diagnostic log containing the bounded model and
-validation trace. Manual processing is always available from the overview and
-jobs views. The HTML is revalidated on every visit and references JavaScript,
-CSS, and favicon assets with a shared content-derived fingerprint. Changed
-assets therefore receive new URLs, while matching fingerprinted assets can be
-cached immutably.
+validation trace. Manual processing is always available from every view; its
+dialog carries the processing scope and, for scopes that publish OCR, a
+three-way existing-OCR choice that defaults to following the setting. Job
+detail surfaces that choice only when the job overrode the setting. The HTML is
+revalidated on every visit and references JavaScript, CSS, and favicon assets
+with a shared content-derived fingerprint. Changed assets therefore receive new
+URLs, while matching fingerprinted assets can be cached immutably.

@@ -267,6 +267,7 @@ main { padding: 34px clamp(24px, 4vw, 58px) 70px; max-width: 1540px; margin: 0 a
 .field input, .field textarea, .field select { width: 100%; min-height: 39px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--input); outline: none; font-weight: 500; font-size: 12px; resize: vertical; }
 .field input:focus, .field textarea:focus, .field select:focus { border-color: #78a89a; box-shadow: 0 0 0 3px rgba(31,102,93,.09); }
 .field small { color: var(--ink-faint); font-weight: 500; line-height: 1.4; }
+.field[hidden] { display: none; }
 .clear-secret { display: flex; align-items: center; gap: 6px; color: var(--ink-faint); font-size: 9px; font-weight: 550; cursor: pointer; }
 .clear-secret input { width: auto; min-height: 0; margin: 0; accent-color: var(--red); }
 .field.locked input, .field.locked select { cursor: not-allowed; color: var(--ink-soft); background: var(--locked); }

@@ -22,7 +22,8 @@ model can transcribe pages while a smaller text model handles classification.
 - By default, when meaningful OCR already exists, preserves its complete file
   and text as a `Pre-Clerk OCR backup` version and creates a latest
   `Paperless Clerk OCR` version containing Clerk's text. This can be disabled to
-  replace OCR on the current version instead.
+  replace OCR on the current version instead, either app-wide or for one
+  manually queued job.
 - Persists and polls Paperless's asynchronous version task so retries resume the
   same upload instead of creating another version.
 - Classifies correspondents, document types, tags, titles, intrinsic dates, and
@@ -55,7 +56,9 @@ The optional backup-version workflow requires Paperless-ngx 3.0 or newer.
    ```
 
 4. Open `http://localhost:8080`, test all three connections in **Settings**, and
-   process a document ID manually.
+   process a document ID manually. **Process documents** takes a processing
+   scope and, for scopes that publish OCR, an existing-OCR choice that overrides
+   the app-wide **Keep original document version** setting for those jobs.
 5. Enable automatic discovery only after the first reviewed run. For an
    explicit opt-in queue, create a Paperless tag such as `clerk` and configure
    it as Clerk's queue/watch tag.
@@ -92,7 +95,9 @@ For a manual or discovered document:
    it had no label, and patches Clerk OCR onto the explicit new version. That
    version is latest while the original reading remains in version history. If
    the setting is disabled, Clerk patches the complete result directly onto the
-   current version without creating a backup.
+   current version without creating a backup. A manually queued job that chose
+   **Keep as version** or **Replace in place** uses that choice instead of the
+   setting, on every attempt of that job.
 6. Metadata text is split at page/paragraph boundaries. Map calls extract
    compact candidates; hierarchical reduce calls operate on those candidates,
    never on the whole source document.
@@ -419,7 +424,7 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_OPENAI_API_KEY` | empty | Optional bearer token shared by both model clients |
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
 | `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic` or `deepseek_ocr_llamacpp` (plus `deepseek_ocr` and `glm_ocr` when unhidden below) |
-| `CLERK_KEEP_ORIGINAL_VERSION` | `true` | Retain existing OCR as a backup file version; `false` replaces OCR on the current version |
+| `CLERK_KEEP_ORIGINAL_VERSION` | `true` | Default for retaining existing OCR as a backup file version; `false` replaces OCR on the current version. A manually queued job may override it |
 | `CLERK_ENABLE_VLLM_PROFILES` | unset | Offer the held-back `deepseek_ocr` and `glm_ocr` profiles again |
 | `CLERK_OCR_MAX_OUTPUT_TOKENS` | `4096` | Per-page OCR output cap; must fit the serving context alongside the page image |
 | `CLERK_METADATA_MODEL` | `qwen2.5:14b` | Metadata model name |
@@ -573,7 +578,10 @@ state flow, reference-project findings, and the exact Paperless API operations.
 
 Interactive OpenAPI documentation is served at `/api/docs`. The UI uses:
 
-- `/api/jobs` for enqueue, status, retry, and cancellation;
+- `/api/jobs` for enqueue, status, retry, and cancellation. `POST` accepts
+  `document_ids`, `mode`, and an optional `keep_original_version` boolean that
+  overrides the setting of the same name for the queued jobs; omitting it leaves
+  each job following the setting as it stands when the job runs;
 - `/api/conflicts` for comparison detail and resolution;
 - `/api/decisions` for metadata rationale;
 - `/api/interventions` for the review desk;

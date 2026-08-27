@@ -520,6 +520,65 @@ async def test_existing_ocr_is_replaced_without_a_version_when_retention_is_disa
 
 
 @pytest.mark.asyncio
+async def test_per_job_choice_replaces_existing_ocr_while_the_setting_keeps_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3, keep_original_version=False)
+    paperless = OCRPreferencePaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(keep_original_version=True)
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert updated["content"] == text
+    assert paperless.version_patches == [(None, {"content": text})]
+    assert paperless.uploads == []
+    assert paperless.version_labels == []
+    events = db.get_job(job["id"], include_events=True)["events"]
+    published = next(event for event in events if event["event_type"] == "ocr_published")
+    assert published["data"]["replaced_existing"] is True
+
+
+@pytest.mark.asyncio
+async def test_per_job_choice_keeps_a_backup_version_while_the_setting_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    job, _ = db.enqueue_job(92, "ocr", 3, keep_original_version=True)
+    paperless = OCRPreferencePaperless()
+    monkeypatch.setattr(processing, "DocumentRenderer", SinglePageRenderer)
+
+    outcome, text, _, updated, _ = await DocumentProcessor(
+        db, Settings(keep_original_version=False)
+    )._process_ocr(  # noqa: SLF001
+        job,
+        dict(paperless.document),
+        paperless,  # type: ignore[arg-type]
+        NearMatchingOCRModel(),  # type: ignore[arg-type]
+    )
+
+    assert outcome and outcome.status == "completed"
+    assert updated["content"] == text
+    assert paperless.version_patches == [(192, {"content": text})]
+    assert paperless.version_contents[92].endswith("payment history.")
+    assert paperless.version_labels == [(92, "Pre-Clerk OCR backup")]
+    assert paperless.uploads == [{"source": "document", "version_label": "Paperless Clerk OCR"}]
+    assert db.get_job(job["id"])["ocr_version_id"] == 192
+
+
+@pytest.mark.asyncio
 async def test_existing_clerk_version_is_reused_without_another_upload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

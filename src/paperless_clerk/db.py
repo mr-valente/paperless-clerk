@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     document_id INTEGER NOT NULL,
     document_title TEXT NOT NULL DEFAULT '',
     mode TEXT NOT NULL CHECK(mode IN ('full', 'ocr', 'metadata')),
+    -- NULL follows the app-wide keep_original_version setting at run time.
+    keep_original_version INTEGER,
     status TEXT NOT NULL,
     phase TEXT NOT NULL DEFAULT 'queued',
     progress_current INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +159,8 @@ class Database:
                 connection.execute("ALTER TABLE jobs ADD COLUMN ocr_version_task_id TEXT")
             if "ocr_version_id" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN ocr_version_id INTEGER")
+            if "keep_original_version" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN keep_original_version INTEGER")
             now = time.time()
             connection.execute(
                 "UPDATE jobs SET status='queued', phase='recovered', worker_id=NULL, "
@@ -189,7 +193,14 @@ class Database:
         max_attempts: int,
         *,
         document_title: str = "",
+        keep_original_version: bool | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        """Queue one document.
+
+        ``keep_original_version`` overrides the app-wide setting of the same
+        name for this job alone. ``None`` leaves the job following whatever the
+        setting says when a worker actually publishes the OCR.
+        """
         now = time.time()
         job_id = str(uuid.uuid4())
         with self.connect() as connection:
@@ -203,13 +214,15 @@ class Database:
                 connection.commit()
                 return dict(existing), False
             connection.execute(
-                "INSERT INTO jobs(id,document_id,document_title,mode,status,phase,max_attempts,"
-                "next_run_at,created_at,updated_at) VALUES(?,?,?,?,'queued','queued',?,?,?,?)",
+                "INSERT INTO jobs(id,document_id,document_title,mode,keep_original_version,status,"
+                "phase,max_attempts,next_run_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued','queued',?,?,?,?)",
                 (
                     job_id,
                     document_id,
                     document_title,
                     mode,
+                    None if keep_original_version is None else int(keep_original_version),
                     max_attempts,
                     now,
                     now,
@@ -218,9 +231,14 @@ class Database:
             )
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             connection.commit()
-        self.add_event(
-            job_id, "info", "enqueued", f"Document {document_id} queued for {mode} processing"
-        )
+        message = f"Document {document_id} queued for {mode} processing"
+        if keep_original_version is not None and mode in {"full", "ocr"}:
+            message += (
+                " keeping any existing OCR as a document version"
+                if keep_original_version
+                else " replacing any existing OCR in place"
+            )
+        self.add_event(job_id, "info", "enqueued", message)
         return dict(row), True
 
     def claim_job(self, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:

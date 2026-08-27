@@ -145,6 +145,35 @@ async def test_health_settings_and_manual_enqueue_api(tmp_path: Path) -> None:
     assert app.state.job_manager.settings_changes == 1
 
 
+@pytest.mark.asyncio
+async def test_manual_enqueue_carries_a_per_job_ocr_retention_choice(tmp_path: Path) -> None:
+    database = Database(tmp_path / "clerk.db")
+    database.initialize()
+    app.state.database = database
+    app.state.settings_manager = SettingsManager(database)
+    app.state.job_manager = FakeManager()
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://clerk.local") as client:
+        replacing = await client.post(
+            "/api/jobs",
+            json={"document_ids": [51], "mode": "ocr", "keep_original_version": False},
+        )
+        keeping = await client.post(
+            "/api/jobs",
+            json={"document_ids": [52], "mode": "full", "keep_original_version": True},
+        )
+        following = await client.post("/api/jobs", json={"document_ids": [53], "mode": "full"})
+        detail = await client.get(f"/api/jobs/{replacing.json()['jobs'][0]['job']['id']}")
+
+    # The API reports the stored SQLite integer as a bool, and None still means
+    # the job follows whatever the setting says when it runs.
+    assert replacing.json()["jobs"][0]["job"]["keep_original_version"] is False
+    assert keeping.json()["jobs"][0]["job"]["keep_original_version"] is True
+    assert following.json()["jobs"][0]["job"]["keep_original_version"] is None
+    assert detail.json()["keep_original_version"] is False
+
+
 def test_clerk_logging_has_a_dedicated_stream_handler() -> None:
     package_logger = logging.getLogger("paperless_clerk")
     original_handlers = list(package_logger.handlers)

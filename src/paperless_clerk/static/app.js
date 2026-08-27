@@ -306,7 +306,7 @@ async function renderSettings() {
       <form class="settings-form" id="settings-form">
         <section class="panel settings-section" id="settings-paperless"><header class="panel-head"><div><h3>Paperless-ngx</h3><p class="section-description">Paperless API connection.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="paperless">Test connection</button></header><div class="panel-body"><div class="form-grid">${settingInput("paperless_url", "Paperless URL", s.paperless_url, { full: true, note: "Root URL or a URL ending in /api." })}${settingInput("paperless_token", "API token", "", { type: "password", configured: s.paperless_token_configured })}</div>${settingCheck("paperless_verify_ssl", "Verify TLS certificates", "Disable only for a trusted local endpoint with a self-signed certificate.", s.paperless_verify_ssl)}</div></section>
         <section class="panel settings-section" id="settings-ai"><header class="panel-head"><div><h3>OpenAI-compatible API</h3><p class="section-description">One local endpoint and credential shared by both Clerk models.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("openai_base_url", "Base URL", s.openai_base_url, { full: true, note: "Usually ends in /v1; Clerk appends /chat/completions." })}${settingInput("openai_api_key", "API key", "", { type: "password", configured: s.openai_api_key_configured, full: true })}</div></div></section>
-        <section class="panel settings-section" id="settings-ocr"><header class="panel-head"><div><h3>Vision OCR model</h3><p class="section-description">Receives one rendered page image per request and publishes only complete OCR.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="ocr">Test OCR model</button></header><div class="panel-body"><div class="form-grid">${settingInput("ocr_model", "Model name", s.ocr_model, { full: true })}${ocrProfileSetting(s)}${settingInput("ocr_max_output_tokens", "Maximum output tokens per page", s.ocr_max_output_tokens, { type: "number", min: 256, note: "Must fit inside the serving context alongside the page image. The model server owns the context limit itself." })}</div>${settingCheck("keep_original_version", "Keep original document version", "When Paperless already has meaningful OCR, preserve its current file and OCR as a backup version before making Clerk OCR the latest. Disable to replace OCR on the current version instead.", s.keep_original_version)}</div></section>
+        <section class="panel settings-section" id="settings-ocr"><header class="panel-head"><div><h3>Vision OCR model</h3><p class="section-description">Receives one rendered page image per request and publishes only complete OCR.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="ocr">Test OCR model</button></header><div class="panel-body"><div class="form-grid">${settingInput("ocr_model", "Model name", s.ocr_model, { full: true })}${ocrProfileSetting(s)}${settingInput("ocr_max_output_tokens", "Maximum output tokens per page", s.ocr_max_output_tokens, { type: "number", min: 256, note: "Must fit inside the serving context alongside the page image. The model server owns the context limit itself." })}</div>${settingCheck("keep_original_version", "Keep original document version", "When Paperless already has meaningful OCR, preserve its current file and OCR as a backup version before making Clerk OCR the latest. Disable to replace OCR on the current version instead. Manually queued jobs can override this per job.", s.keep_original_version)}</div></section>
         <section class="panel settings-section" id="settings-metadata"><header class="panel-head"><div><h3>Metadata model</h3><p class="section-description">Receives bounded OCR chunks and returns structured classification decisions.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="metadata">Test metadata model</button></header><div class="panel-body"><div class="form-grid">${settingInput("metadata_model", "Model name", s.metadata_model, { full: true })}${settingInput("metadata_context_tokens", "Context limit", s.metadata_context_tokens, { type: "number", min: 2048 })}${settingInput("metadata_max_output_tokens", "Maximum output tokens", s.metadata_max_output_tokens, { type: "number", min: 256 })}</div></div></section>
         <section class="panel settings-section" id="settings-workflow"><header class="panel-head"><div><h3>Automation & filing</h3><p class="section-description">Control discovery and conservative vocabulary growth.</p></div></header><div class="panel-body"><div class="check-grid">${settingCheck("automation_enabled", "Automatically process Paperless documents", "Polls Paperless for unseen or subsequently modified documents and queues full OCR plus metadata jobs. Add a queue tag below to make automation opt-in per document.", s.automation_enabled)}${settingCheck("allow_new_tags", "Allow distinct new tags", "Creates broad reusable subjects when the first document of a genuinely new category arrives; near-duplicates still normalize to existing tags.", s.allow_new_tags)}${settingCheck("allow_new_correspondents", "Allow distinct correspondents", "Aliases and abbreviations are aggressively canonicalized.", s.allow_new_correspondents)}${settingCheck("allow_new_document_types", "Allow stable document types", "Specific or synonymous variants are rejected.", s.allow_new_document_types)}${settingCheck("allow_new_custom_fields", "Allow new custom-field definitions", "Experimental and intentionally disabled by default.", s.allow_new_custom_fields)}</div><div class="form-grid">${settingInput("automation_tag", "Paperless queue tag (optional)", s.automation_tag, { full: true, note: "When set, only documents carrying this tag are discovered. Clerk hides it from the model, keeps it on failures or OCR conflicts, and removes it after metadata succeeds." })}${settingInput("automation_interval_seconds", "Discovery interval (seconds)", s.automation_interval_seconds, { type: "number", min: 15 })}${settingInput("metadata_apply_mode", "Existing metadata policy", s.metadata_apply_mode, { type: "select", choices: [["missing_only", "Preserve existing values"], ["overwrite", "Allow confident replacement"]], note: "Tags remain additive in both modes." })}</div></div></section>
         <section class="panel settings-section" id="settings-notifications"><header class="panel-head"><div><h3>Notifications</h3><p class="section-description">ntfy alerts for failures and items requiring intervention.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="notifications">Send test</button></header><div class="panel-body">${settingToggle("notifications_enabled", "Enable ntfy notifications", "Sends alerts for terminal job failures, OCR conflicts, other review states, and Paperless discovery failures. Successful jobs do not generate notifications.", s.notifications_enabled)}<div class="form-grid">${settingInput("ntfy_url", "ntfy server URL", s.ntfy_url, { full: true, note: "Use https://ntfy.sh unless you run your own ntfy server." })}${settingInput("ntfy_topic", "Topic", s.ntfy_topic, { full: true })}${settingInput("ntfy_token", "Access token (optional)", "", { type: "password", configured: s.ntfy_token_configured, full: true })}</div></div></section>
@@ -329,7 +329,7 @@ async function showJob(id) {
   try {
     const job = await api(`/api/jobs/${id}`);
     openDrawer(`${drawerHeader(`Paperless document #${job.document_id}`, job.document_title || `Document ${job.document_id}`)}<div class="drawer-body">
-      <section class="detail-section"><div class="detail-grid"><div class="detail-stat"><span>Status</span><strong>${titleCase(job.status)}</strong></div><div class="detail-stat"><span>Scope</span><strong>${titleCase(job.mode)}</strong></div><div class="detail-stat"><span>Attempt</span><strong>${job.attempt} / ${job.max_attempts}</strong></div><div class="detail-stat"><span>Phase</span><strong>${titleCase(job.phase)}</strong></div><div class="detail-stat"><span>OCR pages</span><strong>${job.progress_total ? `${job.progress_current} / ${job.progress_total}` : "—"}</strong></div><div class="detail-stat"><span>Started</span><strong>${relativeTime(job.started_at)}</strong></div></div></section>
+      <section class="detail-section"><div class="detail-grid"><div class="detail-stat"><span>Status</span><strong>${titleCase(job.status)}</strong></div><div class="detail-stat"><span>Scope</span><strong>${titleCase(job.mode)}</strong></div><div class="detail-stat"><span>Attempt</span><strong>${job.attempt} / ${job.max_attempts}</strong></div><div class="detail-stat"><span>Phase</span><strong>${titleCase(job.phase)}</strong></div><div class="detail-stat"><span>OCR pages</span><strong>${job.progress_total ? `${job.progress_current} / ${job.progress_total}` : "—"}</strong></div><div class="detail-stat"><span>Started</span><strong>${relativeTime(job.started_at)}</strong></div>${job.keep_original_version === null || job.keep_original_version === undefined ? "" : `<div class="detail-stat"><span>Existing OCR</span><strong>${job.keep_original_version ? "Keep as version" : "Replace in place"}</strong></div>`}</div></section>
       ${job.error_message ? `<section class="detail-section"><h3>Last error</h3><div class="resolution-box"><p class="danger-text">${escapeHtml(job.error_message)}</p></div></section>` : ""}
       ${job.page_failures?.length ? `<section class="detail-section"><h3>Page failures</h3><div class="change-list">${job.page_failures.map((page) => `<div class="change"><i>!</i><div><strong>Page ${page.page_number} · ${escapeHtml(titleCase(page.status))}</strong><small>${escapeHtml(page.error || "No page error detail was returned.")} · ${page.attempts} attempt${page.attempts === 1 ? "" : "s"}</small></div></div>`).join("")}</div></section>` : ""}
       <section class="detail-section"><h3>Run events</h3><div class="event-list">${job.events.length ? job.events.map((event) => `<div class="event ${event.level}"><strong>${escapeHtml(titleCase(event.event_type))}</strong><span>${fullTime(event.created_at)}</span><p>${escapeHtml(event.message)}</p></div>`).join("") : `<p class="muted">No events retained.</p>`}</div></section>
@@ -393,16 +393,34 @@ async function resolveConflict(id, resolution) {
 }
 
 function parseIds(value) { return [...new Set(value.split(/[^0-9]+/).filter(Boolean).map(Number).filter((id) => id > 0))]; }
-async function enqueue(documentIds, mode = "full") {
-  const result = await api("/api/jobs", { method: "POST", body: JSON.stringify({ document_ids: documentIds, mode }) });
+async function enqueue(documentIds, mode = "full", keepOriginalVersion = null) {
+  const payload = { document_ids: documentIds, mode };
+  // Omitted entirely so the job keeps following the app-wide setting.
+  if (keepOriginalVersion !== null) payload.keep_original_version = keepOriginalVersion;
+  const result = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
   const created = result.jobs.filter((item) => item.created).length;
   toast("Documents queued", `${created} new job${created === 1 ? "" : "s"}; ${result.jobs.length - created} already active.`);
+}
+
+const retentionField = document.querySelector("#process-retention");
+const retentionNote = document.querySelector("#process-retention-note");
+
+function refreshRetentionField() {
+  const mode = new FormData(processForm).get("mode");
+  // Metadata-only jobs never publish OCR, so the choice has nothing to act on.
+  retentionField.hidden = mode === "metadata";
+  const settingDefault = state.settings?.keep_original_version === undefined
+    ? ""
+    : state.settings.keep_original_version
+      ? " The setting currently keeps the original as a backup version."
+      : " The setting currently replaces OCR on the current version.";
+  retentionNote.textContent = `Applies only to documents that already have meaningful OCR.${settingDefault}`;
 }
 
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-action]"); if (!target) return;
   const action = target.dataset.action;
-  if (action === "open-process") processDialog.showModal();
+  if (action === "open-process") { refreshRetentionField(); processDialog.showModal(); }
   if (action === "close-process") processDialog.close();
   if (action === "close-drawer") closeDrawer();
   if (action === "job-detail") showJob(target.dataset.id);
@@ -429,12 +447,17 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape") cl
 document.querySelector("#mobile-menu").addEventListener("click", () => document.querySelector(".sidebar").classList.toggle("mobile-open"));
 document.querySelectorAll(".nav-list a").forEach((item) => item.addEventListener("click", () => document.querySelector(".sidebar").classList.remove("mobile-open")));
 
+processForm.addEventListener("change", (event) => { if (event.target.name === "mode") refreshRetentionField(); });
+
 processForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(processForm); const ids = parseIds(String(form.get("document_ids") || ""));
   if (!ids.length) return toast("Enter at least one document ID", "", "error");
+  const mode = String(form.get("mode"));
+  const retention = String(form.get("keep_original_version") || "");
+  const keepOriginalVersion = retention === "" || mode === "metadata" ? null : retention === "keep";
   const button = processForm.querySelector('[type="submit"]'); button.disabled = true;
-  try { await enqueue(ids, String(form.get("mode"))); processDialog.close(); processForm.reset(); if (state.route !== "jobs") location.hash = "jobs"; else await renderRoute({ quiet: true }); }
+  try { await enqueue(ids, mode, keepOriginalVersion); processDialog.close(); processForm.reset(); refreshRetentionField(); if (state.route !== "jobs") location.hash = "jobs"; else await renderRoute({ quiet: true }); }
   catch (error) { toast("Could not queue documents", error.message, "error"); }
   finally { button.disabled = false; }
 });
