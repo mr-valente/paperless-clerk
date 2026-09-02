@@ -25,6 +25,10 @@ class Settings(BaseModel):
 
     openai_base_url: str = "http://host.docker.internal:11434/v1"
     openai_api_key: SecretStr = SecretStr("")
+    # Empty leaves the local server's default in place. The selected effort is
+    # sent with both OCR and metadata requests and can be withdrawn per client
+    # when an older OpenAI-compatible server rejects it.
+    model_reasoning: Literal["", "off", "low", "medium", "high"] = ""
     ocr_model: str = "qwen2.5vl:7b"
     ocr_profile: str = "generic"
     keep_original_version: bool = True
@@ -168,6 +172,7 @@ ENVIRONMENT_FIELDS = {
     "PAPERLESS_VERIFY_SSL": "paperless_verify_ssl",
     "CLERK_OPENAI_BASE_URL": "openai_base_url",
     "CLERK_OPENAI_API_KEY": "openai_api_key",
+    "CLERK_MODEL_REASONING": "model_reasoning",
     "CLERK_OCR_MODEL": "ocr_model",
     "CLERK_OCR_PROFILE": "ocr_profile",
     "CLERK_KEEP_ORIGINAL_VERSION": "keep_original_version",

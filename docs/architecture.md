@@ -52,6 +52,11 @@ Durable worker pool
     +---- ntfy client (terminal failure and intervention alerts)
 ```
 
+The optional `model_reasoning` setting applies to both local model clients. It
+is sent as `reasoning_effort`, or as the `enable_thinking` chat-template
+argument for `off`; if a server rejects the hint, that client withdraws it and
+continues with the existing request contract.
+
 There is no Redis or external task service. SQLite uses WAL mode, short
 transactions, a partial unique index for active document jobs, and leases so a
 crashed worker can resume work after restart.

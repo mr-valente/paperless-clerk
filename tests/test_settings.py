@@ -129,6 +129,26 @@ def test_shared_openai_environment_url_is_authoritative(
     assert "openai_base_url" in restarted.get().public_dict()["environment_overrides"]
 
 
+def test_reasoning_effort_has_bounded_choices_and_an_environment_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert Settings().model_reasoning == ""
+    assert Settings(model_reasoning="high").model_reasoning == "high"
+    with pytest.raises(ValueError):
+        Settings(model_reasoning="extreme")
+
+    db = Database(tmp_path / "clerk.db")
+    db.initialize()
+    manager = SettingsManager(db)
+    manager.update({"model_reasoning": "low"})
+    monkeypatch.setenv("CLERK_MODEL_REASONING", "off")
+
+    restarted = SettingsManager(db)
+
+    assert restarted.get().model_reasoning == "off"
+    assert "model_reasoning" in restarted.get().public_dict()["environment_overrides"]
+
+
 def test_ocr_profile_can_be_persisted_or_managed_by_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

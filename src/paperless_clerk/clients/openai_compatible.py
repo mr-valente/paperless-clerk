@@ -26,6 +26,7 @@ _REFUSAL_PREFIXES = ("i cannot", "i can't", "i am unable", "i'm unable", "sorry,
 # A cycle has to repeat this many times before we treat it as a decoder loop
 # rather than a page that genuinely repeats a line.
 _LOOP_MIN_REPEATS = 3
+_REASONING_KEYS = ("reasoning_effort", "chat_template_kwargs")
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +99,8 @@ class OpenAICompatibleClient:
         self.api_key = settings.secret_value("openai_api_key")
         self.max_output_tokens = getattr(settings, f"{purpose}_max_output_tokens")
         self.max_retries = settings.model_max_retries
+        self.reasoning = settings.model_reasoning
+        self._reasoning_refused = False
         self.profile = ocr_profile(settings.ocr_profile if purpose == "ocr" else "generic")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -121,6 +124,7 @@ class OpenAICompatibleClient:
         last_error: Exception | None = None
         format_fallback_stage = 0
         attempt = 0
+        payload = {**payload, **self.reasoning_fields()}
         while attempt <= self.max_retries:
             try:
                 response = await self.client.post(self.completions_url, json=payload)
@@ -129,6 +133,23 @@ class OpenAICompatibleClient:
                     if not isinstance(body, dict):
                         raise ValueError("response body must be a JSON object")
                     return body
+                if response.status_code in {400, 404, 422} and any(
+                    key in payload for key in _REASONING_KEYS
+                ):
+                    # Withdraw the newest, server-specific hint before
+                    # structured output degrades, so an older server can still
+                    # use the existing request contract.
+                    self._reasoning_refused = True
+                    log.warning(
+                        "%s model server rejected the reasoning setting (%s); "
+                        "sending requests without it",
+                        self.purpose,
+                        response.status_code,
+                    )
+                    payload = {
+                        key: value for key, value in payload.items() if key not in _REASONING_KEYS
+                    }
+                    continue
                 if (
                     allow_format_fallback
                     and response.status_code in {400, 404, 422}
@@ -173,6 +194,14 @@ class OpenAICompatibleClient:
                 await asyncio.sleep(min(4, 0.5 * (2**attempt)))
                 attempt += 1
         raise ModelError(f"{self.purpose} model request failed: {last_error}", retryable=True)
+
+    def reasoning_fields(self) -> dict[str, Any]:
+        """Return the server-specific request fields for the selected effort."""
+        if self._reasoning_refused or not self.reasoning:
+            return {}
+        if self.reasoning == "off":
+            return {"chat_template_kwargs": {"enable_thinking": False}}
+        return {"reasoning_effort": self.reasoning}
 
     @staticmethod
     def _content(body: dict[str, Any]) -> str:

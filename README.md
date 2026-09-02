@@ -422,6 +422,7 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `PAPERLESS_VERIFY_SSL` | `true` | Verify Paperless TLS certificates |
 | `CLERK_OPENAI_BASE_URL` | `http://host.docker.internal:11434/v1` | Shared local endpoint for OCR and metadata models |
 | `CLERK_OPENAI_API_KEY` | empty | Optional bearer token shared by both model clients |
+| `CLERK_MODEL_REASONING` | *(server default)* | Reasoning effort for both local models: `off`, `low`, `medium`, or `high`; unsupported hints are withdrawn automatically |
 | `CLERK_OCR_MODEL` | `qwen2.5vl:7b` | Vision model name |
 | `CLERK_OCR_PROFILE` | `generic` | OCR request contract: `generic` or `deepseek_ocr_llamacpp` (plus `deepseek_ocr` and `glm_ocr` when unhidden below) |
 | `CLERK_KEEP_ORIGINAL_VERSION` | `true` | Default for retaining existing OCR as a backup file version; `false` replaces OCR on the current version. A manually queued job may override it |

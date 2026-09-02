@@ -61,6 +61,71 @@ async def test_structured_output_falls_back_without_consuming_retry_budget() -> 
     assert all('"answer"' in prompt for prompt in schema_prompts)
 
 
+@pytest.mark.asyncio
+async def test_reasoning_effort_is_sent_and_withdrawn_when_the_server_refuses_it() -> None:
+    payloads: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        if "chat_template_kwargs" in payload:
+            return httpx.Response(400, text="unknown field chat_template_kwargs")
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"answer":"ready"}'}}]}
+        )
+
+    settings = Settings(model_reasoning="off", model_max_retries=0)
+    client = OpenAICompatibleClient(settings, "metadata")
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        await client.structured(
+            name="answer",
+            schema={"type": "object", "properties": {"answer": {"type": "string"}}},
+            system="Return JSON",
+            user="First",
+        )
+        await client.structured(
+            name="answer",
+            schema={"type": "object", "properties": {"answer": {"type": "string"}}},
+            system="Return JSON",
+            user="Second",
+        )
+    finally:
+        await client.close()
+
+    assert payloads[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in payloads[1]
+    assert payloads[1]["response_format"]["type"] == "json_schema"
+    assert "chat_template_kwargs" not in payloads[2]
+    assert len(payloads) == 3
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+@pytest.mark.asyncio
+async def test_reasoning_levels_are_sent_to_ocr_and_metadata_clients(effort: str) -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    settings = Settings(model_reasoning=effort)
+    ocr = await _ocr_client(settings, handler)
+    metadata = OpenAICompatibleClient(settings, "metadata")
+    await metadata.client.aclose()
+    metadata.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await ocr.ocr_page(b"fake image", page_number=1)
+        await metadata.test_connection()
+    finally:
+        await ocr.close()
+        await metadata.close()
+
+    assert [request["reasoning_effort"] for request in requests] == [effort, effort]
+
+
 async def _ocr_client(settings: Settings, handler) -> OpenAICompatibleClient:
     client = OpenAICompatibleClient(settings, "ocr")
     await client.client.aclose()
