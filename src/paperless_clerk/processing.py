@@ -59,6 +59,36 @@ def _watch_tag_from_catalog(
     )
 
 
+def _without_hidden_tags(
+    document: dict[str, Any], catalog: dict[str, list[dict[str, Any]]], settings: Settings
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    """Hide Paperless inbox tags and configured workflow tags from model inputs.
+
+    They mark processing state rather than filing subjects, so the model should
+    neither see them as vocabulary nor count them as the document's existing tags.
+    """
+    hidden_names = settings.hidden_tag_names
+    hidden_ids = {
+        int(tag["id"])
+        for tag in catalog.get("tags", [])
+        if tag.get("is_inbox_tag") or _normalized_tag_name(tag.get("name")) in hidden_names
+    }
+    if not hidden_ids:
+        return document, catalog
+    return (
+        {
+            **document,
+            "tags": [
+                int(tag_id) for tag_id in document.get("tags", []) if int(tag_id) not in hidden_ids
+            ],
+        },
+        {
+            **catalog,
+            "tags": [tag for tag in catalog.get("tags", []) if int(tag["id"]) not in hidden_ids],
+        },
+    )
+
+
 def _without_watch_tag(
     document: dict[str, Any], catalog: dict[str, list[dict[str, Any]]], name: str
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
@@ -593,6 +623,9 @@ class DocumentProcessor:
         model_document, model_catalog, _ = _without_watch_tag(
             document, catalog, self.settings.automation_tag
         )
+        model_document, model_catalog = _without_hidden_tags(
+            model_document, model_catalog, self.settings
+        )
         analyzer = MetadataAnalyzer(self.settings, model)
 
         def progress(phase: str, current: int, total: int) -> None:
@@ -616,6 +649,9 @@ class DocumentProcessor:
             live_catalog = await paperless.catalog()
             _, planning_catalog, watch_tag = _without_watch_tag(
                 live_document, live_catalog, self.settings.automation_tag
+            )
+            _, planning_catalog = _without_hidden_tags(
+                live_document, planning_catalog, self.settings
             )
             plan = MetadataPlanner(self.settings).validate(
                 proposal, planning_catalog, allowed_ids=trace["candidate_ids"]
@@ -667,6 +703,7 @@ class DocumentProcessor:
             "candidate_ids": trace["candidate_ids"],
             "candidate_vocabulary": trace.get("candidate_vocabulary", {}),
             "tag_review": tag_review,
+            "vocabulary_review": trace.get("vocabulary_review"),
             "model_diagnostics": trace.get("model_diagnostics", []),
         }
         decision_status = "no_tags" if tagless else ("applied" if applied["patch"] else "no_change")
@@ -775,6 +812,11 @@ class JobManager:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    @property
+    def vocabulary_lock(self) -> asyncio.Lock:
+        """Shared with the API so vocabulary merges never race job validation."""
+        return self._vocabulary_lock
 
     def wake(self) -> None:
         self._wake.set()

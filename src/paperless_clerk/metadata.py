@@ -5,11 +5,12 @@ import json
 import logging
 import math
 import re
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
@@ -30,6 +31,8 @@ from paperless_clerk.prompts import (
     METADATA_SYSTEM_PROMPT,
     TAG_ABSTENTION_AUDIT_SYSTEM_PROMPT,
     TAG_REVIEW_SYSTEM_PROMPT,
+    VOCABULARY_AUDIT_SYSTEM_PROMPT,
+    VOCABULARY_REVIEW_SYSTEM_PROMPT,
 )
 from paperless_clerk.schemas import (
     ChunkAnalysis,
@@ -38,8 +41,19 @@ from paperless_clerk.schemas import (
     MetadataProposal,
     NewCustomFieldCandidate,
     ScalarCandidate,
+    StrictModel,
     TagReview,
+    VocabularyAudit,
+    VocabularyReview,
+    model_prompt_schema,
 )
+
+StructuredModel = TypeVar("StructuredModel", bound=StrictModel)
+# Entries of each kind shown to the vocabulary gatekeeper and auditor. These calls
+# see the whole library rather than the relevance-ranked candidate subset, so a
+# synonym cannot hide behind the candidate limit; the cap only bounds the prompt
+# for unusually large libraries.
+VOCABULARY_REVIEW_LIMIT = 400
 
 ProgressCallback = Callable[[str, int, int], None]
 log = logging.getLogger(__name__)
@@ -108,6 +122,231 @@ class MetadataAnalyzer:
         self.model = model
         self._document_id: int | None = None
         self._model_diagnostics: list[dict[str, Any]] = []
+
+    def _system(self, prompt: str) -> str:
+        """Attach the configured tag-granularity guidance to a system prompt."""
+        guidance = self.settings.metadata_tag_guidance.strip()
+        return f"{prompt}\n\nTag guidance: {guidance}" if guidance else prompt
+
+    async def _request_structured(
+        self,
+        payload: dict[str, Any],
+        *,
+        system: str,
+        stage: str,
+        schema_name: str,
+        model_cls: type[StructuredModel],
+        error_label: str,
+        repair_hint: str,
+    ) -> StructuredModel:
+        """One bounded structured call with schema-feedback repair, like the other stages."""
+        user = json.dumps(payload, ensure_ascii=False)
+        last_error: Exception | None = None
+        for attempt in range(self.settings.model_max_retries + 1):
+            try:
+                raw = await self.model.structured(
+                    name=schema_name,
+                    schema=model_prompt_schema(model_cls),
+                    system=self._system(system),
+                    user=user,
+                )
+                result = model_cls.model_validate(raw)
+                self._record_diagnostic(
+                    {
+                        "stage": stage,
+                        "status": "completed",
+                        "attempt": attempt + 1,
+                        "maximum_attempts": self.settings.model_max_retries + 1,
+                        "recovered_after_validation_error": attempt > 0,
+                    }
+                )
+                return result
+            except ValidationError as exc:
+                last_error = exc
+                self._record_validation_failure(stage=stage, attempt=attempt, exc=exc, raw=raw)
+                previous = json.dumps(raw, ensure_ascii=False)[:4_000]
+                errors = json.dumps(_validation_details(exc), ensure_ascii=False)[:2_000]
+                user = (
+                    json.dumps(payload, ensure_ascii=False)
+                    + "\n\nRepair the previous output instead of repeating it. "
+                    + repair_hint
+                    + f"\nPrevious output: {previous}\nValidation errors: {errors}"
+                )
+            except ModelError as exc:
+                self._record_model_failure(stage=stage, attempt=attempt, exc=exc)
+                if not exc.retryable:
+                    raise
+                last_error = exc
+            if attempt < self.settings.model_max_retries:
+                await asyncio.sleep(min(2, 0.25 * (2**attempt)))
+        raise ModelError(
+            f"{error_label} remained invalid after retries: {last_error}", retryable=True
+        ) from last_error
+
+    async def _review_new_vocabulary(
+        self,
+        document: dict[str, Any],
+        proposal: MetadataProposal,
+        catalog: dict[str, list[dict[str, Any]]],
+    ) -> tuple[MetadataProposal, dict[str, Any], dict[str, list[int]]]:
+        """Gate every proposed new name against the complete existing vocabulary.
+
+        The map and reduce stages judge novelty with the vocabulary as one input among
+        many, and local models miss synonyms there (Optometry beside Optical). This
+        single focused call sees only the proposals and the whole library, and may
+        map a proposal onto an existing entry, drop it, or canonicalize its name.
+        Failures keep the original proposal: the lexical planner still runs after.
+        """
+        proposals: list[tuple[str, MetadataChoice]] = []
+        if proposal.correspondent and proposal.correspondent.new_name:
+            proposals.append(("correspondent", proposal.correspondent))
+        if proposal.document_type and proposal.document_type.new_name:
+            proposals.append(("document_type", proposal.document_type))
+        proposals.extend(("tag", tag) for tag in proposal.tags if tag.new_name)
+        review: dict[str, Any] = {"performed": False, "status": "not_needed", "verdicts": []}
+        if not proposals:
+            return proposal, review, {}
+
+        entities = {
+            "tag": entities_from_payload(catalog["tags"]),
+            "correspondent": entities_from_payload(catalog["correspondents"]),
+            "document_type": entities_from_payload(catalog["document_types"]),
+        }
+        by_id = {kind: {item.id: item for item in values} for kind, values in entities.items()}
+        payload = {
+            "task": "Decide whether each proposed new vocabulary entry duplicates an existing one.",
+            "document": {
+                "paperless_id": document.get("id"),
+                "current_title": document.get("title", ""),
+            },
+            "decision": {
+                "correspondent": _compact_candidate(proposal.correspondent),
+                "document_type": _compact_candidate(proposal.document_type),
+            },
+            "proposals": [
+                {
+                    "kind": kind,
+                    "name": choice.new_name,
+                    "reason": choice.reason[:240],
+                    "evidence": choice.evidence[:240],
+                }
+                for kind, choice in proposals
+            ],
+            "existing_vocabulary": {
+                "tags": _vocabulary_listing(entities["tag"]),
+                "correspondents": _vocabulary_listing(entities["correspondent"]),
+                "document_types": _vocabulary_listing(entities["document_type"]),
+            },
+        }
+        try:
+            result = await self._request_structured(
+                payload,
+                system=VOCABULARY_REVIEW_SYSTEM_PROMPT,
+                stage="vocabulary_review",
+                schema_name="clerk_vocabulary_review",
+                model_cls=VocabularyReview,
+                error_label="Vocabulary review",
+                repair_hint="Use exactly the top-level key verdicts with one verdict per proposal.",
+            )
+        except ModelError as exc:
+            log.warning(
+                "Vocabulary review failed document=%s; keeping %s proposal(s) as submitted: %s",
+                self._document_id,
+                len(proposals),
+                exc,
+            )
+            review.update(performed=True, status="failed", assessment=str(exc)[:300])
+            return proposal, review, {}
+
+        verdicts = {
+            (verdict.kind, _fold(verdict.proposed_name)): verdict for verdict in result.verdicts
+        }
+        records: list[dict[str, Any]] = []
+        reused_ids: dict[str, list[int]] = defaultdict(list)
+
+        def resolve(kind: str, choice: MetadataChoice) -> MetadataChoice | None:
+            assert choice.new_name is not None
+            record: dict[str, Any] = {"kind": kind, "proposed": choice.new_name}
+            records.append(record)
+            verdict = verdicts.get((kind, _fold(choice.new_name)))
+            if verdict is None:
+                record["outcome"] = "unreviewed"
+                return choice
+            record["reason"] = verdict.reason
+            if verdict.decision == "reuse":
+                entity = by_id[kind].get(verdict.existing_id) if verdict.existing_id else None
+                if entity is None:
+                    record.update(outcome="kept", note="reuse verdict named an unknown ID")
+                    return choice
+                reused_ids[kind].append(entity.id)
+                record.update(outcome="reused", existing_id=entity.id, existing_name=entity.name)
+                return choice.model_copy(update={"existing_id": entity.id, "new_name": None})
+            if verdict.decision == "drop":
+                record["outcome"] = "dropped"
+                return None
+            name = " ".join((verdict.name or "").split())[:100]
+            if name and name != choice.new_name:
+                record.update(outcome="renamed", name=name)
+                return choice.model_copy(update={"new_name": name})
+            record["outcome"] = "created"
+            return choice
+
+        correspondent = proposal.correspondent
+        if correspondent and correspondent.new_name:
+            correspondent = resolve("correspondent", correspondent)
+        document_type = proposal.document_type
+        if document_type and document_type.new_name:
+            document_type = resolve("document_type", document_type)
+        tags: list[MetadataChoice] = []
+        seen_ids: set[int] = set()
+        for tag in proposal.tags:
+            resolved = resolve("tag", tag) if tag.new_name else tag
+            if resolved is None:
+                continue
+            if resolved.existing_id is not None:
+                # A proposal mapped onto an existing tag may now repeat a tag the
+                # model had already selected by ID.
+                if resolved.existing_id in seen_ids:
+                    continue
+                seen_ids.add(resolved.existing_id)
+            tags.append(resolved)
+        review.update(performed=True, status="reviewed", verdicts=records)
+        log.info(
+            "Vocabulary review document=%s proposals=%s outcomes=%s",
+            self._document_id,
+            len(proposals),
+            ",".join(
+                f"{record['kind']}:{record['proposed']}={record['outcome']}" for record in records
+            ),
+        )
+        updated = proposal.model_copy(
+            update={"correspondent": correspondent, "document_type": document_type, "tags": tags}
+        )
+        return updated, review, dict(reused_ids)
+
+    async def audit_vocabulary(self, catalog: dict[str, list[dict[str, Any]]]) -> VocabularyAudit:
+        """Ask the model for same-kind entries that name one filing concept."""
+        payload = {
+            "task": "Find vocabulary entries that name the same filing concept and should be merged.",
+            "vocabulary": {
+                "tags": _vocabulary_listing(entities_from_payload(catalog["tags"])),
+                "correspondents": _vocabulary_listing(
+                    entities_from_payload(catalog["correspondents"])
+                ),
+                "document_types": _vocabulary_listing(
+                    entities_from_payload(catalog["document_types"])
+                ),
+            },
+        }
+        return await self._request_structured(
+            payload,
+            system=VOCABULARY_AUDIT_SYSTEM_PROMPT,
+            stage="vocabulary_audit",
+            schema_name="clerk_vocabulary_audit",
+            model_cls=VocabularyAudit,
+            error_label="Vocabulary audit",
+            repair_hint="Use exactly the top-level key suggestions.",
+        )
 
     def _record_diagnostic(self, entry: dict[str, Any]) -> None:
         if len(self._model_diagnostics) < MAX_MODEL_DIAGNOSTICS:
@@ -344,6 +583,13 @@ class MetadataAnalyzer:
                 )
             if progress:
                 progress("metadata_tag_review", 1, 1)
+        if progress:
+            progress("metadata_vocabulary_review", 0, 1)
+        proposal, vocabulary_review, reused_ids = await self._review_new_vocabulary(
+            document, proposal, catalog
+        )
+        if progress:
+            progress("metadata_vocabulary_review", 1, 1)
         trace = {
             "chunks": [
                 {"index": chunk.index, "page_start": chunk.page_start, "page_end": chunk.page_end}
@@ -363,8 +609,15 @@ class MetadataAnalyzer:
             },
             "candidate_vocabulary": candidates.prompt_dict(),
             "tag_review": tag_review,
+            "vocabulary_review": vocabulary_review,
             "model_diagnostics": self._model_diagnostics,
         }
+        # The planner only accepts existing IDs the model was shown. An entry the
+        # gatekeeper mapped a proposal onto counts as shown, even when the
+        # relevance-ranked candidate subset left it out.
+        for kind, ids in reused_ids.items():
+            allowed = trace["candidate_ids"][kind]
+            allowed.extend(item for item in ids if item not in allowed)
         return proposal, trace
 
     def _has_usable_tag(self, proposal: MetadataProposal, candidates: CandidateCatalog) -> bool:
@@ -434,7 +687,7 @@ class MetadataAnalyzer:
         }
         reviewed = await self._request_tag_review(
             payload,
-            system=TAG_REVIEW_SYSTEM_PROMPT,
+            system=self._system(TAG_REVIEW_SYSTEM_PROMPT),
             stage="focused_tag_review",
             schema_name="clerk_tag_review",
             error_label="Focused tag review",
@@ -459,7 +712,7 @@ class MetadataAnalyzer:
         try:
             audited = await self._request_tag_review(
                 audit_payload,
-                system=TAG_ABSTENTION_AUDIT_SYSTEM_PROMPT,
+                system=self._system(TAG_ABSTENTION_AUDIT_SYSTEM_PROMPT),
                 stage="tag_abstention_audit",
                 schema_name="clerk_tag_abstention_audit",
                 error_label="Tag abstention audit",
@@ -497,7 +750,7 @@ class MetadataAnalyzer:
             try:
                 raw = await self.model.structured(
                     name=schema_name,
-                    schema=TagReview.model_json_schema(),
+                    schema=model_prompt_schema(TagReview),
                     system=system,
                     user=user,
                 )
@@ -543,9 +796,7 @@ class MetadataAnalyzer:
                 last_error = exc
                 self._record_validation_failure(stage=stage, attempt=attempt, exc=exc, raw=raw)
                 previous = json.dumps(raw, ensure_ascii=False)[:4_000]
-                errors = json.dumps(
-                    exc.errors(include_url=False, include_input=False), ensure_ascii=False
-                )[:2_000]
+                errors = json.dumps(_validation_details(exc), ensure_ascii=False)[:2_000]
                 user = (
                     json.dumps(payload, ensure_ascii=False)
                     + "\n\nRepair the previous output instead of repeating it. "
@@ -595,8 +846,8 @@ class MetadataAnalyzer:
             try:
                 raw = await self.model.structured(
                     name="clerk_chunk_analysis",
-                    schema=ChunkAnalysis.model_json_schema(),
-                    system=METADATA_SYSTEM_PROMPT,
+                    schema=model_prompt_schema(ChunkAnalysis),
+                    system=self._system(METADATA_SYSTEM_PROMPT),
                     user=user,
                 )
                 analysis = ChunkAnalysis.model_validate(raw)
@@ -625,9 +876,7 @@ class MetadataAnalyzer:
                 )
                 expected = ", ".join(ChunkAnalysis.model_fields)
                 previous = json.dumps(raw, ensure_ascii=False)[:4_000]
-                errors = json.dumps(
-                    exc.errors(include_url=False, include_input=False), ensure_ascii=False
-                )[:2_000]
+                errors = json.dumps(_validation_details(exc), ensure_ascii=False)[:2_000]
                 user = (
                     json.dumps(payload, ensure_ascii=False)
                     + "\n\nRepair the previous output instead of repeating it. "
@@ -729,8 +978,8 @@ class MetadataAnalyzer:
             try:
                 raw = await self.model.structured(
                     name="clerk_metadata_proposal",
-                    schema=MetadataProposal.model_json_schema(),
-                    system=METADATA_REDUCE_SYSTEM_PROMPT,
+                    schema=model_prompt_schema(MetadataProposal),
+                    system=self._system(METADATA_REDUCE_SYSTEM_PROMPT),
                     user=user,
                 )
                 proposal = MetadataProposal.model_validate(raw)
@@ -755,9 +1004,7 @@ class MetadataAnalyzer:
                 )
                 expected = ", ".join(MetadataProposal.model_fields)
                 previous = json.dumps(raw, ensure_ascii=False)[:4_000]
-                errors = json.dumps(
-                    exc.errors(include_url=False, include_input=False), ensure_ascii=False
-                )[:2_000]
+                errors = json.dumps(_validation_details(exc), ensure_ascii=False)[:2_000]
                 user = (
                     json.dumps(payload, ensure_ascii=False)
                     + "\n\nRepair the previous output instead of repeating it. "
@@ -855,15 +1102,15 @@ class MetadataPlanner:
             assert item.new_name is not None
             if (
                 kind == "tag"
-                and self.settings.automation_tag
-                and " ".join(item.new_name.split()).casefold()
-                == self.settings.automation_tag.casefold()
+                and " ".join(item.new_name.split()).casefold() in self.settings.hidden_tag_names
             ):
                 rejected.append(
                     {
                         "kind": kind,
                         "candidate": data,
-                        "reason": "automation watch tag is workflow-only",
+                        "reason": "automation watch tag is workflow-only"
+                        if item.new_name.casefold() == self.settings.automation_tag.casefold()
+                        else "hidden workflow tag",
                     }
                 )
                 return None
@@ -1349,6 +1596,17 @@ def _generic_title(document: dict[str, Any]) -> bool:
         return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
     return bool(original and normalize(title) == normalize(original))
+
+
+def _fold(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+def _vocabulary_listing(
+    entities: list[Entity], limit: int = VOCABULARY_REVIEW_LIMIT
+) -> list[dict[str, Any]]:
+    ordered = sorted(entities, key=lambda item: (-item.document_count, item.name.casefold()))
+    return [item.prompt_dict() for item in ordered[:limit]]
 
 
 def _compact_candidate(candidate: Any) -> dict[str, Any] | None:

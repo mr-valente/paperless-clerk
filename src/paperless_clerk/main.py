@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -21,7 +23,15 @@ from paperless_clerk.clients.paperless import PaperlessClient, PaperlessError
 from paperless_clerk.config import SettingsManager, data_directory
 from paperless_clerk.db import Database
 from paperless_clerk.processing import JobManager, ProcessingError, resolve_conflict
-from paperless_clerk.schemas import EnqueueRequest, ResolveConflictRequest, SettingsPatch
+from paperless_clerk.schemas import (
+    ClearJobsRequest,
+    EnqueueRequest,
+    ResolveConflictRequest,
+    SettingsPatch,
+    VocabularyDismissRequest,
+    VocabularyMergeRequest,
+)
+from paperless_clerk.vocabulary import merge_entities, pair_key, review_vocabulary
 
 log = logging.getLogger(__name__)
 STATIC_DIRECTORY = Path(__file__).parent / "static"
@@ -245,6 +255,12 @@ async def enqueue_jobs(payload: EnqueueRequest, request: Request) -> dict[str, A
     return {"jobs": jobs}
 
 
+@app.post("/api/jobs/clear")
+async def clear_jobs(payload: ClearJobsRequest, request: Request) -> dict[str, int]:
+    """Remove exhausted and cancelled runs from the job history and Intervention list."""
+    return {"deleted": _database(request).clear_jobs(payload.statuses)}
+
+
 @app.post("/api/jobs/{job_id}/retry", status_code=status.HTTP_202_ACCEPTED)
 async def retry_job(job_id: str, request: Request) -> dict[str, Any]:
     job = _database(request).retry_job(job_id)
@@ -321,6 +337,102 @@ async def interventions(request: Request) -> dict[str, Any]:
         "failed_jobs": [_serialize_job(item) for item in failed],
         "review_jobs": [_serialize_job(item) for item in review],
     }
+
+
+VOCABULARY_REVIEW_KEY = "vocabulary_review"
+VOCABULARY_DISMISSED_KEY = "vocabulary_dismissed"
+_merge_lock = asyncio.Lock()
+
+
+def _vocabulary_state(database: Database) -> dict[str, Any]:
+    """The last review with dismissed pairs removed, for the Vocabulary screen."""
+    raw_review = database.get_setting(VOCABULARY_REVIEW_KEY)
+    raw_dismissed = database.get_setting(VOCABULARY_DISMISSED_KEY)
+    review = json.loads(raw_review) if raw_review else None
+    dismissed = set(json.loads(raw_dismissed)) if raw_dismissed else set()
+    if review:
+        review = {
+            **review,
+            "reviewed_at": _timestamp(review.get("reviewed_at")),
+            "suggestions": [
+                item for item in review.get("suggestions", []) if item["key"] not in dismissed
+            ],
+        }
+    return {"review": review, "dismissed_count": len(dismissed)}
+
+
+def _drop_vocabulary_suggestions(database: Database, *, kind: str, entity_ids: set[int]) -> None:
+    raw_review = database.get_setting(VOCABULARY_REVIEW_KEY)
+    if not raw_review:
+        return
+    review = json.loads(raw_review)
+    review["suggestions"] = [
+        item
+        for item in review.get("suggestions", [])
+        if not (item["kind"] == kind and {item["keep_id"], item["merge_id"]} & entity_ids)
+    ]
+    database.set_setting(VOCABULARY_REVIEW_KEY, json.dumps(review))
+
+
+@app.get("/api/vocabulary")
+async def vocabulary(request: Request) -> dict[str, Any]:
+    return _vocabulary_state(_database(request))
+
+
+@app.post("/api/vocabulary/review")
+async def run_vocabulary_review(request: Request) -> dict[str, Any]:
+    """Scan the live Paperless vocabulary for entries that should be merged."""
+    settings = _settings_manager(request).get()
+    paperless = PaperlessClient(settings)
+    model = OpenAICompatibleClient(settings, "metadata")
+    try:
+        review = await review_vocabulary(settings, paperless, model)
+    except PaperlessError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await paperless.close()
+        await model.close()
+    _database(request).set_setting(VOCABULARY_REVIEW_KEY, json.dumps(review))
+    return _vocabulary_state(_database(request))
+
+
+@app.post("/api/vocabulary/merge")
+async def merge_vocabulary(payload: VocabularyMergeRequest, request: Request) -> dict[str, Any]:
+    """Move documents from one entry onto another and delete the emptied entry."""
+    settings = _settings_manager(request).get()
+    manager = request.app.state.job_manager
+    lock: asyncio.Lock = getattr(manager, "vocabulary_lock", _merge_lock)
+    paperless = PaperlessClient(settings)
+    try:
+        # Serialized with job validation so a running job cannot reuse an
+        # entry while it is being deleted.
+        async with lock:
+            result = await merge_entities(
+                paperless, payload.kind, payload.keep_id, payload.merge_id
+            )
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PaperlessError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        await paperless.close()
+    _drop_vocabulary_suggestions(
+        _database(request), kind=payload.kind, entity_ids={payload.merge_id}
+    )
+    return result
+
+
+@app.post("/api/vocabulary/dismiss")
+async def dismiss_vocabulary_suggestion(
+    payload: VocabularyDismissRequest, request: Request
+) -> dict[str, Any]:
+    """Remember that this pair is intentionally distinct so later reviews skip it."""
+    database = _database(request)
+    raw = database.get_setting(VOCABULARY_DISMISSED_KEY)
+    dismissed = set(json.loads(raw)) if raw else set()
+    dismissed.add(pair_key(payload.kind, payload.keep_id, payload.merge_id))
+    database.set_setting(VOCABULARY_DISMISSED_KEY, json.dumps(sorted(dismissed)))
+    return _vocabulary_state(database)
 
 
 @app.get("/api/settings")

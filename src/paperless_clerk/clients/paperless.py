@@ -306,6 +306,37 @@ class PaperlessClient:
                 return exact
             raise
 
+    async def document_ids_with(self, kind: str, entity_id: int) -> list[int]:
+        """IDs of every document carrying the given tag, correspondent, or document type."""
+        filters = {
+            "tag": "tags__id__all",
+            "correspondent": "correspondent__id",
+            "document_type": "document_type__id",
+        }
+        documents = await self.list_resource(
+            "documents", params={filters[kind]: entity_id, "fields": "id"}
+        )
+        return [int(item["id"]) for item in documents if item.get("id") is not None]
+
+    async def bulk_edit(
+        self, document_ids: list[int], method: str, parameters: dict[str, Any]
+    ) -> None:
+        """Apply one Paperless bulk-edit operation in bounded batches."""
+        for start in range(0, len(document_ids), 100):
+            await self._request(
+                "POST",
+                "documents/bulk_edit/",
+                json={
+                    "documents": document_ids[start : start + 100],
+                    "method": method,
+                    "parameters": parameters,
+                },
+                retry=False,
+            )
+
+    async def delete_entity(self, resource: str, entity_id: int) -> None:
+        await self._request("DELETE", f"{resource.strip('/')}/{entity_id}/", retry=False)
+
     async def list_documents(
         self, *, page_size: int, page: int = 1, tag_name: str = ""
     ) -> tuple[list[dict[str, Any]], bool]:

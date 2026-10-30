@@ -5,6 +5,25 @@ import pytest
 
 from paperless_clerk.config import Settings
 from paperless_clerk.metadata import MetadataAnalyzer, MetadataPlanner, _representative_text
+from paperless_clerk.schemas import ChunkAnalysis, MetadataChoice, MetadataProposal
+
+
+def gate_create_verdicts(user: str) -> dict:
+    """Default vocabulary-gate answer for fakes: approve every proposal unchanged."""
+    payload = json.loads(user)
+    return {
+        "verdicts": [
+            {
+                "kind": item["kind"],
+                "proposed_name": item["name"],
+                "decision": "create",
+                "existing_id": None,
+                "name": None,
+                "reason": "Distinct reusable concept",
+            }
+            for item in payload.get("proposals", [])
+        ]
+    }
 
 
 class FakeStructuredModel:
@@ -16,6 +35,8 @@ class FakeStructuredModel:
         self.tag_review_calls = 0
 
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_chunk_analysis":
             self.map_calls += 1
             self.active_maps += 1
@@ -35,6 +56,8 @@ class FakeStructuredModel:
 
 class RepairingStructuredModel(FakeStructuredModel):
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_chunk_analysis" and self.map_calls == 0:
             self.map_calls += 1
             return {"unexpected": "field"}
@@ -47,6 +70,8 @@ class FlatThenSchemaCorrectModel(FakeStructuredModel):
         self.repair_prompt = ""
 
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_chunk_analysis":
             self.map_calls += 1
             if self.map_calls == 1:
@@ -109,6 +134,8 @@ class FocusedTagReviewModel(FakeStructuredModel):
         self.review_payload: dict = {}
 
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_chunk_analysis":
             self.map_calls += 1
             return {
@@ -168,6 +195,8 @@ class FocusedTagReviewModel(FakeStructuredModel):
 
 class VerboseFocusedTagReviewModel(FocusedTagReviewModel):
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         result = await super().structured(name=name, schema=schema, system=system, user=user)
         if name == "clerk_tag_review":
             result["assessment"] = (
@@ -179,6 +208,8 @@ class VerboseFocusedTagReviewModel(FocusedTagReviewModel):
 
 class RepairingFocusedTagReviewModel(FocusedTagReviewModel):
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_tag_review":
             self.tag_review_calls += 1
             if self.tag_review_calls == 1:
@@ -209,6 +240,8 @@ class VeterinaryAbstentionAuditModel(FakeStructuredModel):
         self.audit_system = ""
 
     async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
         if name == "clerk_chunk_analysis":
             self.map_calls += 1
             return {
@@ -427,7 +460,11 @@ async def test_tag_review_validation_repair_is_retained_in_diagnostics() -> None
         for item in trace["model_diagnostics"]
         if item["stage"] == "focused_tag_review" and item["status"] == "validation_error"
     )
-    completion = trace["model_diagnostics"][-1]
+    completion = next(
+        item
+        for item in reversed(trace["model_diagnostics"])
+        if item["stage"] == "focused_tag_review"
+    )
     assert failure["errors"][0]["path"] == "unsupported"
     assert '"unsupported":true' in failure["output_preview"]
     assert completion["status"] == "completed"
@@ -470,9 +507,19 @@ async def test_first_veterinary_invoice_abstention_is_audited_into_broad_new_tag
     assert model.audit_payload["prior_focused_review"]["tags"] == []
     assert "Veterinary" in model.audit_system
     assert trace["candidate_vocabulary"]["tags"] == [{"id": 50, "name": "Employment", "usage": 5}]
-    assert [item["stage"] for item in trace["model_diagnostics"][-2:]] == [
+    # The new Veterinary tag then passes through the vocabulary gate.
+    assert [item["stage"] for item in trace["model_diagnostics"][-3:]] == [
         "focused_tag_review",
         "tag_abstention_audit",
+        "vocabulary_review",
+    ]
+    assert trace["vocabulary_review"]["verdicts"] == [
+        {
+            "kind": "tag",
+            "proposed": "Veterinary",
+            "reason": "Distinct reusable concept",
+            "outcome": "created",
+        }
     ]
 
 
@@ -485,3 +532,269 @@ def test_focused_tag_review_samples_large_documents_within_budget() -> None:
     assert "[Page 1]" in excerpt
     assert "[Page 100]" in excerpt
     assert excerpt.count("[Page ") <= 8
+
+
+class ValidatorErrorThenValidModel(FakeStructuredModel):
+    """First map output trips a model_validator ValueError, not a schema mismatch."""
+
+    def __init__(self):
+        super().__init__()
+        self.repair_prompt = ""
+
+    async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return gate_create_verdicts(user)
+        if name == "clerk_chunk_analysis":
+            self.map_calls += 1
+            if self.map_calls == 1:
+                return {
+                    "tag_candidates": [
+                        {
+                            "existing_id": 55,
+                            "new_name": "Also a new name",
+                            "confidence": 0.9,
+                            "reason": "Both targets supplied",
+                        }
+                    ]
+                }
+            self.repair_prompt = user
+            return {}
+        return await super().structured(name=name, schema=schema, system=system, user=user)
+
+
+@pytest.mark.asyncio
+async def test_validator_value_error_is_rendered_into_repair_prompt() -> None:
+    # pydantic stores the raw ValueError raised by a validator in the error ``ctx``;
+    # the repair prompt must never hand that object to json.dumps.
+    model = ValidatorErrorThenValidModel()
+    analyzer = MetadataAnalyzer(
+        Settings(model_max_retries=1, metadata_chunk_chars=2000),
+        model,  # type: ignore[arg-type]
+    )
+    catalog = {"tags": [], "correspondents": [], "document_types": [], "custom_fields": []}
+
+    proposal, _ = await analyzer.analyze(
+        document={"id": 89, "tags": []},
+        pages=[(1, "A sufficiently long invoice with an issue date and sender information.")],
+        catalog=catalog,
+    )
+
+    assert model.map_calls == 2
+    assert "provide exactly one of existing_id or new_name" in model.repair_prompt
+    assert proposal.summary == "Conservative aggregate"
+
+
+def test_prompt_schema_requires_nullable_target_fields() -> None:
+    # Grammar-constrained servers let the model skip optional properties, so a
+    # nullable field must be required to force an explicit null.
+    from paperless_clerk.schemas import model_prompt_schema
+
+    chunk_schema = model_prompt_schema(ChunkAnalysis)
+    choice = chunk_schema["$defs"]["MetadataChoice"]
+    assert {"existing_id", "new_name", "confidence", "reason"} <= set(choice["required"])
+    assert "evidence" not in choice["required"]
+    # ChunkAnalysis itself only has list fields with defaults, so nothing is forced there.
+    assert "required" not in chunk_schema
+
+    proposal_schema = model_prompt_schema(MetadataProposal)
+    assert {"correspondent", "document_type", "title", "document_date"} <= set(
+        proposal_schema["required"]
+    )
+    # The pydantic models themselves are untouched: explicit nulls still validate.
+    MetadataChoice(existing_id=4, new_name=None, confidence=0.9, reason="r")
+    assert "existing_id" not in MetadataChoice.model_json_schema().get("required", [])
+
+
+class SynonymGateModel(FakeStructuredModel):
+    """The general pass invents Optometry and a correspondent alias; the gate sees the library."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_payload: dict = {}
+        self.gate_system = ""
+
+    async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            self.gate_payload = json.loads(user)
+            self.gate_system = system
+            return {
+                "verdicts": [
+                    {
+                        "kind": "tag",
+                        "proposed_name": "Optometry",
+                        "decision": "reuse",
+                        "existing_id": 62,
+                        "name": None,
+                        "reason": "Optical already collects eye-care documents",
+                    },
+                    {
+                        "kind": "tag",
+                        "proposed_name": "Postal Service",
+                        "decision": "drop",
+                        "existing_id": None,
+                        "name": None,
+                        "reason": "Restates the correspondent",
+                    },
+                    {
+                        "kind": "tag",
+                        "proposed_name": "medical records",
+                        "decision": "create",
+                        "existing_id": None,
+                        "name": "Health",
+                        "reason": "Broad durable subject",
+                    },
+                    {
+                        "kind": "correspondent",
+                        "proposed_name": "USPS",
+                        "decision": "reuse",
+                        "existing_id": 13,
+                        "name": None,
+                        "reason": "Acronym of the existing correspondent",
+                    },
+                ]
+            }
+        if name == "clerk_chunk_analysis":
+            self.map_calls += 1
+            return {}
+        self.reduce_calls += 1
+        return {
+            "correspondent": {
+                "new_name": "USPS",
+                "confidence": 0.9,
+                "reason": "The letter is from the postal service",
+                "evidence": "USPS",
+                "source_pages": [1],
+            },
+            "tags": [
+                {
+                    "existing_id": 62,
+                    "confidence": 0.9,
+                    "reason": "Eye care subject already in use",
+                    "source_pages": [1],
+                },
+                {
+                    "new_name": "Optometry",
+                    "confidence": 0.9,
+                    "reason": "Issued by an eye doctor",
+                    "source_pages": [1],
+                },
+                {
+                    "new_name": "Postal Service",
+                    "confidence": 0.9,
+                    "reason": "Mailed by the postal service",
+                    "source_pages": [1],
+                },
+                {
+                    "new_name": "medical records",
+                    "confidence": 0.9,
+                    "reason": "Medical record for the patient",
+                    "source_pages": [1],
+                },
+            ],
+            "summary": "Eye prescription mailed by USPS",
+        }
+
+
+@pytest.mark.asyncio
+async def test_vocabulary_gate_reuses_drops_and_canonicalizes_new_names() -> None:
+    model = SynonymGateModel()
+    settings = Settings(metadata_chunk_chars=2000, metadata_candidate_limit=10)
+    analyzer = MetadataAnalyzer(settings, model)  # type: ignore[arg-type]
+    # More tags than the candidate limit, so Optical can fall outside the ranked subset.
+    filler = [
+        {"id": 100 + index, "name": f"Subject {index}", "document_count": 50} for index in range(12)
+    ]
+    catalog = {
+        "tags": [*filler, {"id": 62, "name": "Optical", "document_count": 1}],
+        "correspondents": [{"id": 13, "name": "United States Postal Service", "document_count": 2}],
+        "document_types": [],
+        "custom_fields": [],
+    }
+
+    proposal, trace = await analyzer.analyze(
+        document={"id": 19, "tags": [], "title": "Scan"},
+        pages=[(1, "Contact lens prescription mailed by the United States Postal Service.")],
+        catalog=catalog,
+    )
+
+    assert proposal.correspondent is not None
+    assert (proposal.correspondent.existing_id, proposal.correspondent.new_name) == (13, None)
+    assert [(tag.existing_id, tag.new_name) for tag in proposal.tags] == [
+        (62, None),
+        (None, "Health"),
+    ]
+    outcomes = {
+        record["proposed"]: record["outcome"] for record in trace["vocabulary_review"]["verdicts"]
+    }
+    assert outcomes == {
+        "USPS": "reused",
+        "Optometry": "reused",
+        "Postal Service": "dropped",
+        "medical records": "renamed",
+    }
+    # The gate saw the whole library, not the ranked subset, and the planner may now reuse 62.
+    assert len(model.gate_payload["existing_vocabulary"]["tags"]) == 13
+    assert 62 in trace["candidate_ids"]["tag"]
+    assert 13 in trace["candidate_ids"]["correspondent"]
+    assert "Tag guidance:" in model.gate_system
+    assert "Health" in model.gate_system
+    plan = MetadataPlanner(settings).validate(proposal, catalog, allowed_ids=trace["candidate_ids"])
+    assert [(item["action"], item["name"]) for item in plan.tags] == [
+        ("reuse", "Optical"),
+        ("create", "Health"),
+    ]
+    assert plan.correspondent == {**plan.correspondent, "action": "reuse", "id": 13}
+
+
+class BrokenGateModel(SynonymGateModel):
+    async def structured(self, *, name: str, schema: dict, system: str, user: str) -> dict:
+        if name == "clerk_vocabulary_review":
+            return {"unexpected": True}
+        return await super().structured(name=name, schema=schema, system=system, user=user)
+
+
+@pytest.mark.asyncio
+async def test_vocabulary_gate_failure_keeps_the_proposal_for_the_lexical_planner() -> None:
+    model = BrokenGateModel()
+    analyzer = MetadataAnalyzer(Settings(metadata_chunk_chars=2000, model_max_retries=1), model)  # type: ignore[arg-type]
+    catalog = {
+        "tags": [{"id": 62, "name": "Optical", "document_count": 1}],
+        "correspondents": [{"id": 13, "name": "United States Postal Service", "document_count": 2}],
+        "document_types": [],
+        "custom_fields": [],
+    }
+
+    proposal, trace = await analyzer.analyze(
+        document={"id": 19, "tags": [], "title": "Scan"},
+        pages=[(1, "Contact lens prescription mailed by the United States Postal Service.")],
+        catalog=catalog,
+    )
+
+    assert trace["vocabulary_review"]["status"] == "failed"
+    assert [tag.new_name for tag in proposal.tags] == [
+        None,
+        "Optometry",
+        "Postal Service",
+        "medical records",
+    ]
+    assert proposal.correspondent is not None and proposal.correspondent.new_name == "USPS"
+
+
+@pytest.mark.asyncio
+async def test_vocabulary_gate_is_skipped_without_new_names() -> None:
+    model = FakeStructuredModel()
+    analyzer = MetadataAnalyzer(Settings(metadata_chunk_chars=2000), model)  # type: ignore[arg-type]
+    catalog = {"tags": [], "correspondents": [], "document_types": [], "custom_fields": []}
+
+    _, trace = await analyzer.analyze(
+        document={"id": 1, "tags": [5]},
+        pages=[(1, "A sufficiently long document with nothing new to propose.")],
+        catalog=catalog,
+    )
+
+    assert trace["vocabulary_review"] == {
+        "performed": False,
+        "status": "not_needed",
+        "verdicts": [],
+    }
+    assert all(item["stage"] != "vocabulary_review" for item in trace["model_diagnostics"])

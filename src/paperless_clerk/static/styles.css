@@ -192,8 +192,14 @@ main { padding: 34px clamp(24px, 4vw, 58px) 70px; max-width: 1540px; margin: 0 a
 .panel-link:hover { text-decoration: underline; }
 
 .status-list { display: grid; }
-.job-row, .decision-row, .conflict-row { min-height: 72px; padding: 12px 20px; display: grid; align-items: center; gap: 13px; border-bottom: 1px solid var(--line-soft); transition: background .13s ease; }
-.job-row:last-child, .decision-row:last-child, .conflict-row:last-child { border-bottom: 0; }
+.job-row, .decision-row, .conflict-row, .merge-row { min-height: 72px; padding: 12px 20px; display: grid; align-items: center; gap: 13px; border-bottom: 1px solid var(--line-soft); transition: background .13s ease; }
+.job-row:last-child, .decision-row:last-child, .conflict-row:last-child, .merge-row:last-child { border-bottom: 0; }
+.merge-row { grid-template-columns: minmax(220px, 1.4fr) minmax(160px, 1fr) auto; }
+.merge-row .merge-names { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.merge-row .merge-names b { font-weight: 750; }
+.merge-row .merge-names i { color: var(--ink-faint); font-style: normal; }
+.merge-row .merge-names s { color: var(--ink-faint); }
+.merge-row .source-chip { padding: 2px 7px; border-radius: 99px; background: var(--surface-muted); color: var(--ink-faint); font-size: 9px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
 .clickable { cursor: pointer; }
 .clickable:hover { background: var(--hover); }
 .job-row { grid-template-columns: 42px minmax(150px, 1fr) minmax(130px, .7fr) 100px auto; }

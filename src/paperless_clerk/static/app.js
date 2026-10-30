@@ -4,13 +4,14 @@ const drawerContent = document.querySelector("#drawer-content");
 const scrim = document.querySelector("#scrim");
 const processDialog = document.querySelector("#process-dialog");
 const processForm = document.querySelector("#process-form");
-const state = { route: "overview", dashboard: null, jobs: [], interventions: null, decisions: [], settings: null, jobFilter: "all", poll: null };
+const state = { route: "overview", dashboard: null, jobs: [], interventions: null, decisions: [], settings: null, jobFilter: "all", poll: null, vocabulary: null, vocabularyBusy: false };
 
 const pageMeta = {
   overview: ["Status", "Overview"],
   jobs: ["Job queue", "Processing"],
   review: ["Action required", "Intervention"],
   decisions: ["Metadata history", "Decisions"],
+  vocabulary: ["Controlled vocabulary", "Vocabulary"],
   settings: ["Configuration", "Settings"],
 };
 
@@ -189,6 +190,7 @@ async function renderRoute({ quiet = false } = {}) {
     if (state.route === "jobs") await renderJobs();
     if (state.route === "review") await renderReview();
     if (state.route === "decisions") await renderDecisions();
+    if (state.route === "vocabulary") await renderVocabulary();
     if (state.route === "settings") await renderSettings();
   } catch (error) {
     if (!quiet) content.innerHTML = `<div class="panel">${emptyState("!", "Could not load page", error.message)}</div>`;
@@ -239,8 +241,9 @@ async function renderJobs() {
     if (state.jobFilter === "active") return ["running", "queued", "retry_wait"].includes(job.status);
     return job.status === state.jobFilter;
   });
+  const clearable = state.jobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length;
   content.innerHTML = `<section class="page-intro"><div><h2>Processing jobs</h2><p>Current and previous OCR and metadata jobs.</p></div><div class="actions"><button class="button primary" data-action="open-process">＋ Process documents</button></div></section>
-    <section class="panel"><div class="toolbar"><div class="filter-tabs">${filters.map((filter) => `<button class="${filter === state.jobFilter ? "active" : ""}" data-action="job-filter" data-filter="${filter}">${titleCase(filter)}</button>`).join("")}</div><span class="spacer"></span><input class="search-input" id="job-search" type="search" placeholder="Filter by document or ID" /></div><div class="status-list" id="job-list">${filtered.length ? filtered.map(jobRow).join("") : emptyState("↻", "No matching jobs", "Try another filter or start a processing run.")}</div></section>`;
+    <section class="panel"><div class="toolbar"><div class="filter-tabs">${filters.map((filter) => `<button class="${filter === state.jobFilter ? "active" : ""}" data-action="job-filter" data-filter="${filter}">${titleCase(filter)}</button>`).join("")}</div><span class="spacer"></span>${clearable ? `<button class="button ghost small" data-action="clear-jobs" data-count="${clearable}">Clear ${clearable} failed</button>` : ""}<input class="search-input" id="job-search" type="search" placeholder="Filter by document or ID" /></div><div class="status-list" id="job-list">${filtered.length ? filtered.map(jobRow).join("") : emptyState("↻", "No matching jobs", "Try another filter or start a processing run.")}</div></section>`;
 }
 
 async function renderReview() {
@@ -252,7 +255,7 @@ async function renderReview() {
     ${conflicts.length ? `<div class="alert-banner"><span>◇</span><div><strong>OCR conflicts require review</strong><p>Compare both versions and select the correct text.</p></div></div>` : ""}
     <section class="grid review-grid">
       <article class="panel"><header class="panel-head"><div><h2>OCR conflicts</h2><p>Existing Paperless text versus Clerk vision OCR</p></div>${statusChip(conflicts.length ? "open" : "completed")}</header><div class="status-list">${conflicts.length ? conflicts.map(conflictRow).join("") : emptyState("✓", "No OCR conflicts", "Formatting-only differences are accepted automatically.")}</div></article>
-      <article class="panel"><header class="panel-head"><div><h2>Errors & retries</h2><p>Runs that exhausted bounded retries</p></div>${failed.length || nonConflictReview.length ? statusChip("failed") : statusChip("completed")}</header><div class="status-list">${failed.length || nonConflictReview.length ? [...failed, ...nonConflictReview].map(jobRow).join("") : emptyState("✓", "No exhausted jobs", "Transient failures retry automatically before appearing here.")}</div></article>
+      <article class="panel"><header class="panel-head"><div><h2>Errors & retries</h2><p>Runs that exhausted bounded retries</p></div><div class="row-actions">${failed.length ? `<button class="button ghost small" data-action="clear-jobs" data-count="${failed.length}">Clear ${failed.length} failed</button>` : ""}${failed.length || nonConflictReview.length ? statusChip("failed") : statusChip("completed")}</div></header><div class="status-list">${failed.length || nonConflictReview.length ? [...failed, ...nonConflictReview].map(jobRow).join("") : emptyState("✓", "No exhausted jobs", "Transient failures retry automatically before appearing here.")}</div></article>
     </section>`;
 }
 
@@ -268,6 +271,7 @@ function settingInput(name, label, value, options = {}) {
   const inputId = `setting-${name}`;
   const noteText = locked ? "Managed by an environment variable; remove it and restart to edit here." : options.note;
   const note = noteText ? `<small class="${locked ? "environment-note" : ""}">${escapeHtml(noteText)}</small>` : "";
+  if (type === "textarea") return `<div class="field ${options.full ? "full" : ""} ${locked ? "locked" : ""}"><label for="${inputId}">${escapeHtml(label)}</label><textarea id="${inputId}" name="${name}" rows="${options.rows || 4}" ${locked ? "disabled" : ""}>${escapeHtml(value ?? "")}</textarea>${note}</div>`;
   if (type === "select") return `<div class="field ${options.full ? "full" : ""} ${locked ? "locked" : ""}"><label for="${inputId}">${escapeHtml(label)}</label><select id="${inputId}" name="${name}" ${locked ? "disabled" : ""}>${options.choices.map(([key, text]) => `<option value="${key}" ${value === key ? "selected" : ""}>${escapeHtml(text)}</option>`).join("")}</select>${note}</div>`;
   const clearSecret = type === "password" && configured && !locked ? `<label class="clear-secret" for="clear-${name}"><input id="clear-${name}" type="checkbox" name="clear_${name}" /> Clear saved secret</label>` : "";
   return `<div class="field ${options.full ? "full" : ""} ${locked ? "locked" : ""}"><label for="${inputId}">${escapeHtml(label)}</label><div class="${configured !== undefined ? "input-with-status" : ""}"><input id="${inputId}" name="${name}" type="${type}" value="${type === "password" ? "" : escapeHtml(value ?? "")}" ${options.min !== undefined ? `min="${options.min}"` : ""} ${options.max !== undefined ? `max="${options.max}"` : ""} ${type === "number" ? `step="${options.step || "any"}"` : ""} ${type === "password" ? `placeholder="${configured ? "Leave blank to keep saved secret" : "Enter secret if required"}" autocomplete="new-password"` : ""} ${locked ? "disabled" : ""} />${configured !== undefined ? `<span>${configured ? "configured" : "not set"}</span>` : ""}</div>${clearSecret}${note}</div>`;
@@ -296,6 +300,67 @@ function ocrProfileSetting(settings) {
   });
 }
 
+function gateVerdictTitle(entry) {
+  if (entry.outcome === "reused") return `${entry.proposed} → existing ${entry.existing_name}`;
+  if (entry.outcome === "dropped") return `${entry.proposed} dropped`;
+  if (entry.outcome === "renamed") return `${entry.proposed} created as ${entry.name}`;
+  if (entry.outcome === "created") return `${entry.proposed} created`;
+  return `${entry.proposed} kept as proposed`;
+}
+
+function mergeRow(item) {
+  const usage = (count) => `${count} doc${count === 1 ? "" : "s"}`;
+  return `<article class="merge-row" data-key="${escapeHtml(item.key)}">
+    <div class="merge-names"><s>${escapeHtml(item.merge_name)}</s><i>(${usage(item.merge_usage)}) →</i><b>${escapeHtml(item.keep_name)}</b><i>(${usage(item.keep_usage)})</i><span class="source-chip">${item.source === "model" ? "model" : "lexical"}</span></div>
+    <div class="row-meta">${escapeHtml(item.reason)}</div>
+    <div class="row-actions"><button class="button secondary small" data-action="merge-vocabulary" data-key="${escapeHtml(item.key)}">Merge</button><button class="button ghost small" data-action="swap-vocabulary" data-key="${escapeHtml(item.key)}" title="Keep the other name instead">Swap</button><button class="button ghost small" data-action="dismiss-vocabulary" data-key="${escapeHtml(item.key)}">Dismiss</button></div>
+  </article>`;
+}
+
+async function renderVocabulary() {
+  if (!state.vocabulary) state.vocabulary = await api("/api/vocabulary");
+  const review = state.vocabulary.review;
+  const suggestions = review?.suggestions || [];
+  const kinds = [["tag", "Tags", "Subjects that collect documents across correspondents and forms."], ["document_type", "Document types", "What form a document takes."], ["correspondent", "Correspondents", "Who sent or received the document."]];
+  const counts = review?.counts;
+  content.innerHTML = `<section class="page-intro"><div><h2>Vocabulary review</h2><p>${review ? `Last reviewed ${relativeTime(review.reviewed_at)}${counts ? ` · ${counts.tags} tags, ${counts.document_types} document types, ${counts.correspondents} correspondents` : ""}${review.model_status && review.model_status !== "completed" ? ` · model pass ${escapeHtml(review.model_status)}` : ""}` : "Find existing tags, document types, and correspondents that name the same thing, then merge them in Paperless."}</p></div><div class="actions"><button class="button primary" data-action="review-vocabulary" ${state.vocabularyBusy ? "disabled" : ""}>${state.vocabularyBusy ? "Reviewing…" : review ? "Review again" : "Review vocabulary"}</button></div></section>
+    ${state.vocabularyBusy ? `<div class="alert-banner"><span>≃</span><div><strong>Reviewing the live Paperless vocabulary</strong><p>Lexical checks run instantly; the model pass takes a moment.</p></div></div>` : ""}
+    ${review && !suggestions.length ? `<section class="panel">${emptyState("✓", "No duplicates found", `Nothing to merge${state.vocabulary.dismissed_count ? ` (${state.vocabulary.dismissed_count} dismissed pair${state.vocabulary.dismissed_count === 1 ? "" : "s"} skipped)` : ""}.`)}</section>` : ""}
+    ${!review ? `<section class="panel">${emptyState("≃", "No review yet", "Run a review to list likely duplicates. Nothing changes in Paperless until you merge.")}</section>` : ""}
+    ${kinds.map(([kind, title, description]) => { const items = suggestions.filter((item) => item.kind === kind); return items.length ? `<article class="panel"><header class="panel-head"><div><h2>${title}</h2><p>${description}</p></div><span class="status-chip open">${items.length} to review</span></header><div class="status-list">${items.map(mergeRow).join("")}</div></article>` : ""; }).join("")}`;
+}
+
+function vocabularySuggestion(key) { return state.vocabulary?.review?.suggestions?.find((item) => item.key === key); }
+
+async function reviewVocabulary() {
+  state.vocabularyBusy = true; await renderVocabulary();
+  try { state.vocabulary = await api("/api/vocabulary/review", { method: "POST" }); const count = state.vocabulary.review?.suggestions?.length || 0; toast("Vocabulary reviewed", count ? `${count} likely duplicate${count === 1 ? "" : "s"} found.` : "No duplicates found."); }
+  catch (error) { toast("Review failed", error.message, "error"); }
+  finally { state.vocabularyBusy = false; if (state.route === "vocabulary") await renderVocabulary(); }
+}
+
+async function mergeVocabulary(key) {
+  const item = vocabularySuggestion(key); if (!item) return;
+  if (!window.confirm(`Merge "${item.merge_name}" into "${item.keep_name}"? Every document tagged ${item.merge_name} moves to ${item.keep_name} and ${item.merge_name} is deleted from Paperless.`)) return;
+  try {
+    const result = await api("/api/vocabulary/merge", { method: "POST", body: JSON.stringify({ kind: item.kind, keep_id: item.keep_id, merge_id: item.merge_id }) });
+    toast("Merged", `${result.documents} document${result.documents === 1 ? "" : "s"} moved to ${result.keep.name}.`);
+    state.vocabulary = await api("/api/vocabulary"); await renderVocabulary();
+  } catch (error) { toast("Merge failed", error.message, "error"); }
+}
+
+function swapVocabulary(key) {
+  const item = vocabularySuggestion(key); if (!item) return;
+  [item.keep_id, item.merge_id, item.keep_name, item.merge_name, item.keep_usage, item.merge_usage] = [item.merge_id, item.keep_id, item.merge_name, item.keep_name, item.merge_usage, item.keep_usage];
+  renderVocabulary();
+}
+
+async function dismissVocabulary(key) {
+  const item = vocabularySuggestion(key); if (!item) return;
+  try { state.vocabulary = await api("/api/vocabulary/dismiss", { method: "POST", body: JSON.stringify({ kind: item.kind, keep_id: item.keep_id, merge_id: item.merge_id }) }); toast("Dismissed", "This pair will not be suggested again."); await renderVocabulary(); }
+  catch (error) { toast("Dismiss failed", error.message, "error"); }
+}
+
 async function renderSettings() {
   state.settings = await api("/api/settings");
   const s = state.settings;
@@ -308,7 +373,7 @@ async function renderSettings() {
         <section class="panel settings-section" id="settings-ai"><header class="panel-head"><div><h3>OpenAI-compatible API</h3><p class="section-description">One local endpoint and credential shared by both Clerk models.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("openai_base_url", "Base URL", s.openai_base_url, { full: true, note: "Usually ends in /v1; Clerk appends /chat/completions." })}${settingInput("openai_api_key", "API key", "", { type: "password", configured: s.openai_api_key_configured, full: true })}${settingInput("model_reasoning", "Reasoning effort", s.model_reasoning, { type: "select", full: true, choices: [["", "Server default"], ["off", "Off — answer without thinking"], ["low", "Low"], ["medium", "Medium"], ["high", "High"]], note: "Clerk asks bounded questions about supplied pages and records, so thinking costs output tokens and wall clock without adding much. Sent to both local models as reasoning_effort, or as a chat-template argument for Off; a server that does not recognise it is asked without it for the rest of the run." })}</div></div></section>
         <section class="panel settings-section" id="settings-ocr"><header class="panel-head"><div><h3>Vision OCR model</h3><p class="section-description">Receives one rendered page image per request and publishes only complete OCR.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="ocr">Test OCR model</button></header><div class="panel-body"><div class="form-grid">${settingInput("ocr_model", "Model name", s.ocr_model, { full: true })}${ocrProfileSetting(s)}${settingInput("ocr_max_output_tokens", "Maximum output tokens per page", s.ocr_max_output_tokens, { type: "number", min: 256, note: "Must fit inside the serving context alongside the page image. The model server owns the context limit itself." })}</div>${settingCheck("keep_original_version", "Keep original document version", "When Paperless already has meaningful OCR, preserve its current file and OCR as a backup version before making Clerk OCR the latest. Disable to replace OCR on the current version instead. Manually queued jobs can override this per job.", s.keep_original_version)}</div></section>
         <section class="panel settings-section" id="settings-metadata"><header class="panel-head"><div><h3>Metadata model</h3><p class="section-description">Receives bounded OCR chunks and returns structured classification decisions.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="metadata">Test metadata model</button></header><div class="panel-body"><div class="form-grid">${settingInput("metadata_model", "Model name", s.metadata_model, { full: true })}${settingInput("metadata_context_tokens", "Context limit", s.metadata_context_tokens, { type: "number", min: 2048 })}${settingInput("metadata_max_output_tokens", "Maximum output tokens", s.metadata_max_output_tokens, { type: "number", min: 256 })}</div></div></section>
-        <section class="panel settings-section" id="settings-workflow"><header class="panel-head"><div><h3>Automation & filing</h3><p class="section-description">Control discovery and conservative vocabulary growth.</p></div></header><div class="panel-body"><div class="check-grid">${settingCheck("automation_enabled", "Automatically process Paperless documents", "Polls Paperless for unseen or subsequently modified documents and queues full OCR plus metadata jobs. Add a queue tag below to make automation opt-in per document.", s.automation_enabled)}${settingCheck("allow_new_tags", "Allow distinct new tags", "Creates broad reusable subjects when the first document of a genuinely new category arrives; near-duplicates still normalize to existing tags.", s.allow_new_tags)}${settingCheck("allow_new_correspondents", "Allow distinct correspondents", "Aliases and abbreviations are aggressively canonicalized.", s.allow_new_correspondents)}${settingCheck("allow_new_document_types", "Allow stable document types", "Specific or synonymous variants are rejected.", s.allow_new_document_types)}${settingCheck("allow_new_custom_fields", "Allow new custom-field definitions", "Experimental and intentionally disabled by default.", s.allow_new_custom_fields)}</div><div class="form-grid">${settingInput("automation_tag", "Paperless queue tag (optional)", s.automation_tag, { full: true, note: "When set, only documents carrying this tag are discovered. Clerk hides it from the model, keeps it on failures or OCR conflicts, and removes it after metadata succeeds." })}${settingInput("automation_interval_seconds", "Discovery interval (seconds)", s.automation_interval_seconds, { type: "number", min: 15 })}${settingInput("metadata_apply_mode", "Existing metadata policy", s.metadata_apply_mode, { type: "select", choices: [["missing_only", "Preserve existing values"], ["overwrite", "Allow confident replacement"]], note: "Tags remain additive in both modes." })}</div></div></section>
+        <section class="panel settings-section" id="settings-workflow"><header class="panel-head"><div><h3>Automation & filing</h3><p class="section-description">Control discovery and conservative vocabulary growth.</p></div></header><div class="panel-body"><div class="check-grid">${settingCheck("automation_enabled", "Automatically process Paperless documents", "Polls Paperless for unseen or subsequently modified documents and queues full OCR plus metadata jobs. Add a queue tag below to make automation opt-in per document.", s.automation_enabled)}${settingCheck("allow_new_tags", "Allow distinct new tags", "Creates broad reusable subjects when the first document of a genuinely new category arrives; near-duplicates still normalize to existing tags.", s.allow_new_tags)}${settingCheck("allow_new_correspondents", "Allow distinct correspondents", "Aliases and abbreviations are aggressively canonicalized.", s.allow_new_correspondents)}${settingCheck("allow_new_document_types", "Allow stable document types", "Specific or synonymous variants are rejected.", s.allow_new_document_types)}${settingCheck("allow_new_custom_fields", "Allow new custom-field definitions", "Experimental and intentionally disabled by default.", s.allow_new_custom_fields)}</div><div class="form-grid">${settingInput("automation_tag", "Paperless queue tag (optional)", s.automation_tag, { full: true, note: "When set, only documents carrying this tag are discovered. Clerk hides it from the model, keeps it on failures or OCR conflicts, and removes it after metadata succeeds." })}${settingInput("automation_interval_seconds", "Discovery interval (seconds)", s.automation_interval_seconds, { type: "number", min: 15 })}${settingInput("metadata_apply_mode", "Existing metadata policy", s.metadata_apply_mode, { type: "select", choices: [["missing_only", "Preserve existing values"], ["overwrite", "Allow confident replacement"]], note: "Tags remain additive in both modes." })}${settingInput("metadata_tag_guidance", "Tag granularity guidance", s.metadata_tag_guidance, { type: "textarea", full: true, rows: 5, note: "Appended to every metadata prompt. Name the broad subjects your library should grow toward; new tags are canonicalized to this breadth and synonyms of existing tags are reused instead." })}${settingInput("metadata_hidden_tags", "Hidden workflow tags", s.metadata_hidden_tags, { full: true, note: "Comma-separated tag names that mark processing state rather than subjects. Hidden from the model and never proposed. Paperless inbox tags and the queue tag are hidden automatically." })}</div></div></section>
         <section class="panel settings-section" id="settings-notifications"><header class="panel-head"><div><h3>Notifications</h3><p class="section-description">ntfy alerts for failures and items requiring intervention.</p></div><button class="button ghost small" type="button" data-action="test-connection" data-target="notifications">Send test</button></header><div class="panel-body">${settingToggle("notifications_enabled", "Enable ntfy notifications", "Sends alerts for terminal job failures, OCR conflicts, other review states, and Paperless discovery failures. Successful jobs do not generate notifications.", s.notifications_enabled)}<div class="form-grid">${settingInput("ntfy_url", "ntfy server URL", s.ntfy_url, { full: true, note: "Use https://ntfy.sh unless you run your own ntfy server." })}${settingInput("ntfy_topic", "Topic", s.ntfy_topic, { full: true })}${settingInput("ntfy_token", "Access token (optional)", "", { type: "password", configured: s.ntfy_token_configured, full: true })}</div></div></section>
         <section class="panel settings-section" id="settings-appearance"><header class="panel-head"><div><h3>Appearance</h3><p class="section-description">Personalize this browser without changing Paperless or processing behavior.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("appearance_theme", "Color theme", s.appearance_theme, { type: "select", choices: [["system", "Follow system"], ["light", "Light"], ["dark", "Dark"]], note: "Previewed immediately and saved for all Clerk sessions." })}${settingInput("appearance_density", "Interface density", s.appearance_density, { type: "select", choices: [["comfortable", "Comfortable"], ["compact", "Compact"]] })}${settingInput("appearance_motion", "Animation and motion", s.appearance_motion, { type: "select", choices: [["system", "Follow system"], ["full", "Full motion"], ["reduced", "Reduced motion"]], full: true, note: "Reduced motion minimizes transitions, loaders, and drawer animation." })}</div></div></section>
         <section class="panel settings-section" id="settings-advanced"><header class="panel-head"><div><h3>Limits & reliability</h3><p class="section-description">Bound memory and inference without imposing a document page limit.</p></div></header><div class="panel-body"><div class="form-grid">${settingInput("page_concurrency", "Concurrent OCR pages", s.page_concurrency, { type: "number", min: 1, max: 16 })}${settingInput("metadata_concurrency", "Concurrent metadata chunks", s.metadata_concurrency, { type: "number", min: 1, max: 8 })}${settingInput("job_workers", "Document workers", s.job_workers, { type: "number", min: 1, max: 8, note: "Changing this requires a restart." })}${settingInput("job_max_attempts", "Whole-job attempts", s.job_max_attempts, { type: "number", min: 1, max: 10 })}${settingInput("model_max_retries", "Request retries", s.model_max_retries, { type: "number", min: 0, max: 10 })}${settingInput("request_timeout_seconds", "Request timeout (seconds)", s.request_timeout_seconds, { type: "number", min: 10, note: "Also bounds each wait for Paperless to finish creating a file version; retries resume the same Paperless task." })}${settingInput("render_dpi", "Page render DPI", s.render_dpi, { type: "number", min: 72, max: 400 })}${settingInput("max_image_pixels", "Maximum page pixels", s.max_image_pixels, { type: "number", min: 1000000 })}${settingInput("ocr_min_chars", "Meaningful OCR characters", s.ocr_min_chars, { type: "number", min: 1 })}${settingInput("metadata_chunk_chars", "Metadata chunk characters", s.metadata_chunk_chars, { type: "number", min: 2000 })}${settingInput("metadata_candidate_limit", "Vocabulary candidates per type", s.metadata_candidate_limit, { type: "number", min: 10, max: 500 })}${settingInput("metadata_min_confidence", "Minimum metadata confidence", s.metadata_min_confidence, { type: "number", min: 0, max: 1 })}${settingInput("log_level", "Container log detail", s.log_level, { type: "select", choices: [["DEBUG", "Debug"], ["INFO", "Info (recommended)"], ["WARNING", "Warnings only"], ["ERROR", "Errors only"]], full: true, note: "Clerk lifecycle and decision counts appear at Info. Changing this requires a restart." })}</div></div></section>
@@ -365,6 +430,7 @@ async function showDecision(id) {
     const item = await api(`/api/decisions/${id}`);
     const reused = item.applied?.reused || [], created = item.applied?.created || [], removed = item.applied?.removed || [], assignments = item.applied?.assignments || [], withheld = item.applied?.withheld || [], duplicates = item.rationale?.candidate_duplicates || [], rejected = item.rationale?.rejected || [];
     const tagReview = item.rationale?.tag_review;
+    const gate = item.rationale?.vocabulary_review;
     const diagnosticLog = JSON.stringify(decisionDiagnosticLog(item), null, 2);
     const rationaleNote = (entry, fallback) => `${fallback}${entry.confidence !== undefined ? ` · ${Math.round(entry.confidence * 100)}% confidence` : ""}${entry.reason ? ` · ${entry.reason}` : ""}${entry.source_pages?.length ? ` · page${entry.source_pages.length === 1 ? "" : "s"} ${entry.source_pages.join(", ")}` : ""}${entry.evidence ? ` · “${String(entry.evidence).slice(0, 140)}”` : ""}`;
     const changes = [...reused.map((entry) => ({ icon: "↺", title: `Reused ${entry.name}`, note: rationaleNote(entry, titleCase(entry.resource)) })), ...created.map((entry) => ({ icon: "+", title: `Created ${entry.name}`, note: rationaleNote(entry, titleCase(entry.resource)) })), ...removed.map((entry) => ({ icon: "−", title: `Removed ${entry.name}`, note: entry.reason })), ...assignments.map((entry) => ({ icon: "✓", title: `Set ${entry.field_name || titleCase(entry.field)}`, note: rationaleNote(entry, String(entry.value)) })), ...withheld.map((entry) => ({ icon: "—", title: `Preserved ${titleCase(entry.field)}`, note: entry.reason }))];
@@ -372,6 +438,7 @@ async function showDecision(id) {
       <section class="detail-section"><div class="detail-grid"><div class="detail-stat"><span>Outcome</span><strong>${titleCase(item.status)}</strong></div><div class="detail-stat"><span>Vocabulary reused</span><strong>${reused.length}</strong></div><div class="detail-stat"><span>Vocabulary created</span><strong>${created.length}</strong></div></div></section>
       <section class="detail-section"><h3>Decision summary</h3><p class="muted">${escapeHtml(item.rationale?.summary || "No model summary was provided.")}</p><div class="change-list">${changes.length ? changes.map((change) => `<div class="change"><i>${change.icon}</i><div><strong>${escapeHtml(change.title)}</strong><small>${escapeHtml(change.note)}</small></div></div>`).join("") : `<p class="muted">No Paperless fields needed to change.</p>`}</div></section>
       ${tagReview ? `<section class="detail-section"><h3>Tag assessment</h3><div class="change-list"><div class="change"><i>${tagReview.accepted_count ? "✓" : "?"}</i><div><strong>${tagReview.accepted_count ? `${tagReview.accepted_count} tag${tagReview.accepted_count === 1 ? "" : "s"} accepted` : "No applicable tag selected"}</strong><small>${escapeHtml(tagReview.assessment || "No assessment was recorded.")}${tagReview.performed ? " · focused second pass performed" : ""}${tagReview.abstention_audit_performed ? " · empty result challenged once" : ""}</small></div></div></div></section>` : ""}
+      ${gate?.verdicts?.length || gate?.status === "failed" ? `<section class="detail-section"><h3>Vocabulary gate</h3><div class="change-list">${gate.status === "failed" ? `<div class="change"><i>!</i><div><strong>Gate unavailable; proposals kept as submitted</strong><small>${escapeHtml(gate.assessment || "")}</small></div></div>` : gate.verdicts.map((entry) => `<div class="change"><i>${{ reused: "↺", dropped: "×", renamed: "✎", created: "+" }[entry.outcome] || "?"}</i><div><strong>${escapeHtml(gateVerdictTitle(entry))}</strong><small>${escapeHtml(titleCase(entry.kind))}${entry.reason ? ` · ${escapeHtml(entry.reason)}` : ""}${entry.note ? ` · ${escapeHtml(entry.note)}` : ""}</small></div></div>`).join("")}</div></section>` : ""}
       ${duplicates.length ? `<section class="detail-section"><h3>Vocabulary overlap checks</h3><div class="change-list">${duplicates.map((entry) => `<div class="change"><i>≃</i><div><strong>${escapeHtml(entry.outcome === "created_as_explicit_distinction" ? `${entry.proposed} kept distinct from ${entry.matched_name}` : `${entry.proposed} → ${entry.matched_name}`)}</strong><small>${escapeHtml(entry.reason)} · ${Math.round(entry.score * 100)}% similarity${entry.justification ? ` · ${escapeHtml(entry.justification)}` : ""}</small></div></div>`).join("")}</div></section>` : ""}
       ${rejected.length ? `<section class="detail-section"><h3>Omitted candidates</h3><div class="change-list">${rejected.slice(0, 20).map((entry) => `<div class="change"><i>×</i><div><strong>${escapeHtml(titleCase(entry.kind))}</strong><small>${escapeHtml(entry.reason)}</small></div></div>`).join("")}</div></section>` : ""}
       <section class="detail-section"><h3>Applied Paperless patch</h3><pre class="code-block">${escapeHtml(JSON.stringify(item.applied?.patch || {}, null, 2))}</pre></section>
@@ -384,6 +451,17 @@ async function showDecision(id) {
 async function retryJob(id) {
   try { await api(`/api/jobs/${id}/retry`, { method: "POST" }); toast("Job queued", "Saved page results will be reused where possible."); closeDrawer(); await renderRoute({ quiet: true }); }
   catch (error) { toast("Retry failed", error.message, "error"); }
+}
+
+async function clearJobs(count) {
+  const noun = count === 1 ? "job" : "jobs";
+  if (!window.confirm(`Delete ${count} failed or cancelled ${noun} from the history? Documents in Paperless are not affected.`)) return;
+  try {
+    const result = await api("/api/jobs/clear", { method: "POST", body: JSON.stringify({ statuses: ["failed", "cancelled"] }) });
+    toast("History cleared", `${result.deleted} ${result.deleted === 1 ? "job" : "jobs"} removed.`);
+    await refreshDashboard();
+    await renderRoute({ quiet: true });
+  } catch (error) { toast("Clear failed", error.message, "error"); }
 }
 
 async function resolveConflict(id, resolution) {
@@ -438,6 +516,11 @@ document.addEventListener("click", async (event) => {
   if (action === "cancel-job") { event.stopPropagation(); try { await api(`/api/jobs/${target.dataset.id}/cancel`, { method: "POST" }); toast("Job cancelled"); await renderRoute({ quiet: true }); } catch (error) { toast("Cancel failed", error.message, "error"); } }
   if (action === "resolve-conflict") resolveConflict(target.dataset.id, target.dataset.resolution);
   if (action === "job-filter") { state.jobFilter = target.dataset.filter; renderJobs(); }
+  if (action === "clear-jobs") { event.stopPropagation(); clearJobs(Number(target.dataset.count)); }
+  if (action === "review-vocabulary") reviewVocabulary();
+  if (action === "merge-vocabulary") mergeVocabulary(target.dataset.key);
+  if (action === "swap-vocabulary") swapVocabulary(target.dataset.key);
+  if (action === "dismiss-vocabulary") dismissVocabulary(target.dataset.key);
   if (action === "test-connection") { target.disabled = true; const old = target.textContent; const testName = target.dataset.target === "ocr" ? "OCR test" : target.dataset.target === "notifications" ? "Notification test" : "Connection"; target.textContent = "Testing…"; try { const result = await api(`/api/settings/test/${target.dataset.target}`, { method: "POST" }); const detail = result.message || (result.model ? `${result.model}: ${result.response}` : `${result.documents} Paperless documents visible`); toast(`${testName} succeeded`, detail); } catch (error) { toast(`${testName} failed`, error.message, "error"); } finally { target.disabled = false; target.textContent = old; } }
   if (action === "reprocess-metadata") { try { await enqueue([Number(target.dataset.documentId)], "metadata"); closeDrawer(); } catch (error) { toast("Could not queue metadata", error.message, "error"); } }
 });
@@ -522,7 +605,7 @@ async function initialize() {
   try { const health = await api("/api/health"); document.querySelector("#app-version").textContent = `Paperless Clerk ${health.version}`; }
   catch { /* main route will show the error */ }
   await navigateFromHash();
-  state.poll = setInterval(async () => { if (document.hidden || state.route === "settings" || drawer.classList.contains("open")) return; try { await renderRoute({ quiet: true }); } catch { /* retain last good screen */ } }, 5000);
+  state.poll = setInterval(async () => { if (document.hidden || state.route === "settings" || state.route === "vocabulary" || drawer.classList.contains("open")) return; try { await renderRoute({ quiet: true }); } catch { /* retain last good screen */ } }, 5000);
 }
 
 initialize();

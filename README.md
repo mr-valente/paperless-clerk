@@ -31,6 +31,14 @@ model can transcribe pages while a smaller text model handles classification.
 - Retrieves the live Paperless vocabulary before every metadata run, validates
   all reused IDs, normalizes aliases and near-duplicates, and permits carefully
   justified vocabulary growth.
+- Gates every proposed new tag, correspondent, or document type through one
+  focused model check against the complete existing vocabulary, so a synonym
+  such as Optometry is filed under an existing Optical instead of created, a tag
+  that merely restates the correspondent is dropped, and new names are
+  canonicalized to the configured breadth.
+- Offers an on-demand vocabulary review that finds existing duplicates with the
+  same lexical rules plus one model pass, and merges them in Paperless on
+  request.
 - Uses page-aware map/reduce metadata analysis, so a 100-page PDF is never sent
   to a model as one request.
 - Keeps durable SQLite jobs, retries, conflicts, decision history, and bounded
@@ -149,6 +157,20 @@ The queue/watch tag changes which documents are eligible:
 This makes the tag a dependable inbox marker: disappearance means Clerk
 finished the filing decision, while a retained tag remains visible for retry or
 intervention.
+
+Failed and cancelled runs stay in the job history until you clear them from the
+Processing or Intervention screen (or `POST /api/jobs/clear`). Completed jobs and
+their decisions are never removed that way.
+
+### Vocabulary review
+
+The **Vocabulary** screen runs an on-demand audit of the live Paperless tags,
+correspondents, and document types. It lists likely duplicates found by the same
+lexical rules the planner applies (acronyms, spelling variants, modifier-only
+names) plus one metadata-model pass that catches synonyms. Each suggestion can be
+merged in either direction, which moves every document onto the kept entry and
+deletes the other, or dismissed so later reviews skip that pair. Nothing changes
+in Paperless until you click **Merge**.
 
 ## Model endpoint contract
 
@@ -449,6 +471,8 @@ separate checkbox clears it intentionally. Settings responses expose only
 | `CLERK_ALLOW_NEW_CORRESPONDENTS` | `true` | Permit validated distinct correspondents |
 | `CLERK_ALLOW_NEW_DOCUMENT_TYPES` | `true` | Permit validated stable types |
 | `CLERK_ALLOW_NEW_CUSTOM_FIELDS` | `false` | Permit new field definitions |
+| `CLERK_METADATA_TAG_GUIDANCE` | broad personal-filing subjects | Granularity guidance appended to every metadata prompt; edit it to name the subjects your library should grow toward |
+| `CLERK_METADATA_HIDDEN_TAGS` | empty | Comma-separated workflow tags hidden from the model and never proposed; Paperless inbox tags and the queue tag are hidden automatically |
 | `CLERK_AUTOMATION_ENABLED` | `false` | Poll and enqueue new or changed eligible documents |
 | `CLERK_AUTOMATION_INTERVAL_SECONDS` | `120` | Discovery interval |
 | `CLERK_AUTOMATION_PAGE_SIZE` | `25` | Documents inspected on each newest/backlog poll |

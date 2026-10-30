@@ -10,6 +10,15 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 
 from paperless_clerk.ocr_profiles import PROFILE_KEYS, available_profiles
 
+DEFAULT_TAG_GUIDANCE = (
+    "Tags are broad personal-filing subjects that each gather many documents over the years, "
+    "such as Health, Finance, Insurance, Taxes, Housing, Vehicle, Employment, Education, Legal, "
+    "Travel, Pets, Utilities, and Technology. Prefer the broad subject over a specialty "
+    "(Health rather than Optometry), the field over the provider (Veterinary rather than a clinic "
+    "name), and the category over the product (Technology rather than a motherboard model). "
+    "A tag that only restates the correspondent or the document type is not a tag."
+)
+
 
 class Settings(BaseModel):
     """Runtime settings.
@@ -64,6 +73,14 @@ class Settings(BaseModel):
     allow_new_correspondents: bool = True
     allow_new_document_types: bool = True
     allow_new_custom_fields: bool = False
+    # Granularity guidance shown to every metadata model call. It describes the
+    # breadth a tag should have, so a first-of-kind document grows the
+    # vocabulary by one broad subject rather than a specialty or product name.
+    metadata_tag_guidance: str = Field(default=DEFAULT_TAG_GUIDANCE, max_length=1500)
+    # Comma-separated tag names that are workflow markers rather than filing
+    # subjects. They are hidden from the model and never proposed. Paperless
+    # inbox tags are hidden automatically.
+    metadata_hidden_tags: str = Field(default="", max_length=1000)
 
     automation_enabled: bool = False
     automation_interval_seconds: int = Field(default=120, ge=15, le=86_400)
@@ -100,6 +117,25 @@ class Settings(BaseModel):
     @classmethod
     def normalize_tag(cls, value: str) -> str:
         return " ".join(value.split())
+
+    @field_validator("metadata_tag_guidance")
+    @classmethod
+    def normalize_guidance(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("metadata_hidden_tags")
+    @classmethod
+    def normalize_hidden_tags(cls, value: str) -> str:
+        names = [" ".join(part.split()) for part in value.split(",")]
+        return ", ".join(dict.fromkeys(name for name in names if name))
+
+    @property
+    def hidden_tag_names(self) -> set[str]:
+        """Casefolded workflow tag names the model must never see or propose."""
+        names = {part.casefold() for part in self.metadata_hidden_tags.split(", ") if part}
+        if self.automation_tag:
+            names.add(self.automation_tag.casefold())
+        return names
 
     @field_validator("ntfy_topic")
     @classmethod
@@ -198,6 +234,8 @@ ENVIRONMENT_FIELDS = {
     "CLERK_ALLOW_NEW_CORRESPONDENTS": "allow_new_correspondents",
     "CLERK_ALLOW_NEW_DOCUMENT_TYPES": "allow_new_document_types",
     "CLERK_ALLOW_NEW_CUSTOM_FIELDS": "allow_new_custom_fields",
+    "CLERK_METADATA_TAG_GUIDANCE": "metadata_tag_guidance",
+    "CLERK_METADATA_HIDDEN_TAGS": "metadata_hidden_tags",
     "CLERK_AUTOMATION_ENABLED": "automation_enabled",
     "CLERK_AUTOMATION_INTERVAL_SECONDS": "automation_interval_seconds",
     "CLERK_AUTOMATION_PAGE_SIZE": "automation_page_size",

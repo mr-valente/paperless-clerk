@@ -195,3 +195,132 @@ def test_clerk_logging_has_a_dedicated_stream_handler() -> None:
         package_logger.setLevel(original_level)
         package_logger.propagate = original_propagate
         package_logger.disabled = original_disabled
+
+
+@pytest.mark.asyncio
+async def test_clear_jobs_removes_only_failed_and_cancelled_runs(tmp_path: Path) -> None:
+    database = Database(tmp_path / "clerk.db")
+    database.initialize()
+    app.state.database = database
+    app.state.settings_manager = SettingsManager(database)
+    app.state.job_manager = FakeManager()
+    failed, _ = database.enqueue_job(1, "full", 3)
+    cancelled, _ = database.enqueue_job(2, "full", 3)
+    completed, _ = database.enqueue_job(3, "full", 3)
+    queued, _ = database.enqueue_job(4, "full", 3)
+    database.fail_or_retry(failed["id"], "model_error", "boom", retryable=False)
+    database.add_event(failed["id"], "info", "note", "an event to cascade")
+    assert database.cancel_job(cancelled["id"])
+    database.finish_job(completed["id"])
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://clerk.local") as client:
+        cleared = await client.post("/api/jobs/clear", json={"statuses": ["failed", "cancelled"]})
+        rejected = await client.post("/api/jobs/clear", json={"statuses": ["completed"]})
+        remaining = await client.get("/api/jobs")
+
+    assert cleared.status_code == 200
+    assert cleared.json() == {"deleted": 2}
+    assert rejected.status_code == 422
+    assert sorted(job["document_id"] for job in remaining.json()) == [3, 4]
+    assert database.get_job(failed["id"], include_events=True) is None
+    assert database.get_job(queued["id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_vocabulary_review_merge_and_dismiss_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paperless_clerk.main as main
+
+    database = Database(tmp_path / "clerk.db")
+    database.initialize()
+    app.state.database = database
+    app.state.settings_manager = SettingsManager(database)
+    app.state.job_manager = FakeManager()
+    suggestions = [
+        {
+            "key": "tag:3:4",
+            "kind": "tag",
+            "keep_id": 3,
+            "keep_name": "Optical",
+            "keep_usage": 2,
+            "merge_id": 4,
+            "merge_name": "Optometry",
+            "merge_usage": 1,
+            "reason": "Same subject",
+            "source": "model",
+        },
+        {
+            "key": "tag:1:2",
+            "kind": "tag",
+            "keep_id": 1,
+            "keep_name": "Taxes",
+            "keep_usage": 6,
+            "merge_id": 2,
+            "merge_name": "Income Taxes",
+            "merge_usage": 1,
+            "reason": "modifier",
+            "source": "lexical",
+        },
+    ]
+    merges: list[tuple] = []
+
+    async def fake_review(settings, paperless, model):
+        return {
+            "reviewed_at": 1_700_000_000.0,
+            "counts": {"tags": 4, "document_types": 1, "correspondents": 2},
+            "model_status": "completed",
+            "suggestions": suggestions,
+        }
+
+    async def fake_merge(paperless, kind, keep_id, merge_id):
+        merges.append((kind, keep_id, merge_id))
+        return {
+            "kind": kind,
+            "keep": {"id": keep_id, "name": "Optical"},
+            "merged": {"id": merge_id, "name": "Optometry"},
+            "documents": 2,
+        }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main, "review_vocabulary", fake_review)
+    monkeypatch.setattr(main, "merge_entities", fake_merge)
+    monkeypatch.setattr(main, "PaperlessClient", FakeClient)
+    monkeypatch.setattr(main, "OpenAICompatibleClient", FakeClient)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://clerk.local") as client:
+        empty = await client.get("/api/vocabulary")
+        reviewed = await client.post("/api/vocabulary/review")
+        dismissed = await client.post(
+            "/api/vocabulary/dismiss", json={"kind": "tag", "keep_id": 1, "merge_id": 2}
+        )
+        merged = await client.post(
+            "/api/vocabulary/merge", json={"kind": "tag", "keep_id": 3, "merge_id": 4}
+        )
+        same_entry = await client.post(
+            "/api/vocabulary/merge", json={"kind": "tag", "keep_id": 3, "merge_id": 3}
+        )
+        after = await client.get("/api/vocabulary")
+        reviewed_again = await client.post("/api/vocabulary/review")
+
+    assert empty.json() == {"review": None, "dismissed_count": 0}
+    assert [item["key"] for item in reviewed.json()["review"]["suggestions"]] == [
+        "tag:3:4",
+        "tag:1:2",
+    ]
+    assert reviewed.json()["review"]["reviewed_at"].startswith("2023-11-14")
+    assert [item["key"] for item in dismissed.json()["review"]["suggestions"]] == ["tag:3:4"]
+    assert merged.status_code == 200 and merges == [("tag", 3, 4)]
+    assert same_entry.status_code == 422
+    assert after.json()["review"]["suggestions"] == []
+    assert after.json()["dismissed_count"] == 1
+    # A dismissed pair stays hidden on later reviews; the merged pair returns only because the fake still reports it.
+    assert [item["key"] for item in reviewed_again.json()["review"]["suggestions"]] == ["tag:3:4"]

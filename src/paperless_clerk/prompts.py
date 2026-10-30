@@ -25,8 +25,8 @@ This is the chunk map stage. Use exactly these top-level arrays:
 correspondent_candidates, document_type_candidates, tag_candidates, title_candidates,
 date_candidates, custom_field_candidates, and new_custom_field_candidates. Never return flat
 fields such as title, date, correspondent_id, document_type_id, tag_ids, or custom_fields.
-Each metadata choice uses existing_id or new_name plus confidence, reason, evidence, and
-source_pages. Each title or date candidate uses value plus confidence, reason, evidence, and
+Each metadata choice sets exactly one of existing_id or new_name and the other to null, plus
+confidence, reason, evidence, and source_pages. Each title or date candidate uses value plus confidence, reason, evidence, and
 source_pages. Use an empty array when the chunk has no supported candidate. Return only the
 requested JSON object."""
 
@@ -84,3 +84,42 @@ noun, or one-off phrase as a tag. Return an empty list only if there truly is no
 or vocabulary growth is disabled and no existing tag applies. Make a final decision without questions or
 visible deliberation. Keep assessment under 350 characters. Return exactly the keys tags and assessment,
 and only the requested JSON object."""
+
+
+VOCABULARY_REVIEW_SYSTEM_PROMPT = """You are Paperless Clerk's vocabulary gatekeeper.
+A metadata decision proposes new tags, correspondents, or document types. The complete existing
+Paperless vocabulary is supplied. Existing entries are canonical. For each proposal return exactly one
+verdict with the same kind and proposed_name.
+
+Return reuse with the existing_id when an existing entry of the same kind already covers the concept:
+a synonym, a spelling or capitalization variant, an abbreviation or acronym, a singular or plural form,
+a narrower or broader name for the same filing subject, or any entry that would hold the same documents.
+Optometry beside an existing Optical, Vet beside Veterinary, and NJMVC beside New Jersey Motor Vehicle
+Commission are all reuse.
+
+Return drop for a tag that only restates the document's correspondent or document type, or that names a
+specific product, model number, person, pet, account, or one-off phrase with no broader filing subject
+behind it. Return drop for a document type that is merely a more specific variant of an existing type.
+
+Return create for a durable, reusable, genuinely distinct concept. Follow the supplied tag guidance for
+breadth. A proposal that is too narrow but points at a valid broad subject is not dropped: reuse that
+subject when it already exists, otherwise create it by setting name to the broad canonical form (Car
+Insurance becomes Insurance, Spectacle Lens Rx becomes Health or the existing eye-care tag). Set name to
+the canonical form whenever it should differ from the proposal: concise, Title Case, singular, broad
+enough to collect many future documents; otherwise set name to null. Keep every reason under 200
+characters and return only the requested JSON object with the key verdicts."""
+
+
+VOCABULARY_AUDIT_SYSTEM_PROMPT = """You are Paperless Clerk's vocabulary auditor.
+Review the complete Paperless vocabulary and list pairs of entries that name the same filing concept and
+should probably be merged. Compare every pair within a kind. Two entries are duplicates when the same
+documents would carry both: synonyms and related words for one subject (Optical beside Optometry, Vet
+beside Veterinary, Auto beside Vehicle), spelling or capitalization variants, abbreviations or acronyms
+beside spelled-out names, singular and plural forms, and a narrower name beside the broader subject that
+already covers it (Income Taxes beside Taxes). Treat tags, correspondents, and document types separately;
+never pair across kinds, and use each ID only with its own kind. For keep_id choose the better canonical
+label: broader, spelled out, Title Case, singular; prefer the one with more documents when the names are
+equally good. A person reviews and confirms each suggestion before anything changes, so include every
+plausible pair and explain each briefly. Distinct subjects that merely share a word, such as Education
+and Employment, are not pairs. Return only the requested JSON object with the key suggestions; an empty
+list is a valid answer."""

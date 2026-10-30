@@ -842,3 +842,24 @@ async def test_divergent_existing_ocr_is_backed_up_without_intervention(
     assert updated["content"] == text
     assert paperless.version_contents[92] == original
     assert db.list_conflicts() == []
+
+
+def test_inbox_and_configured_workflow_tags_are_hidden_from_the_model() -> None:
+    settings = Settings(metadata_hidden_tags="paperless-gpt-failed, ocr-conflict")
+    document = {"id": 91, "tags": [7, 8, 9]}
+    catalog = {
+        "tags": [
+            {"id": 7, "name": "Employment"},
+            {"id": 8, "name": "Inbox", "is_inbox_tag": True},
+            {"id": 9, "name": "OCR-Conflict"},
+        ],
+        "correspondents": [],
+        "document_types": [],
+        "custom_fields": [],
+    }
+
+    model_document, model_catalog = processing._without_hidden_tags(document, catalog, settings)
+
+    assert model_document["tags"] == [7]
+    assert [tag["id"] for tag in model_catalog["tags"]] == [7]
+    assert document["tags"] == [7, 8, 9]

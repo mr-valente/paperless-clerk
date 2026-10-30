@@ -125,6 +125,16 @@ occur only after all required model work and validation has succeeded.
    allows Invoice plus a broad Veterinary tag while rejecting the composite
    Veterinary Invoice. Preserve an explicit abstention assessment when no tag
    is justified after the audit.
+5a. If the proposal would create any tag, correspondent, or document type, run
+   one vocabulary gate call that sees only those proposals and the complete
+   existing vocabulary of all three kinds (not the ranked candidate subset).
+   Each proposal is mapped onto an existing entry, dropped (a tag restating the
+   correspondent or type, or a product, person, or one-off), or created under a
+   canonical name at the configured breadth. Entries the gate reuses are added
+   to the IDs the planner will accept. A failed gate keeps the proposal, so the
+   lexical planner remains the floor. Every prompt also carries the configured
+   tag-granularity guidance, and inbox or configured workflow tags are removed
+   from the document and vocabulary the model sees.
 6. Serialize the short validation/write section across document workers and
    re-fetch the vocabulary inside that lock, preventing concurrent alias
    proposals from creating near-duplicates. Validate every existing ID against
@@ -149,6 +159,13 @@ occur only after all required model work and validation has succeeded.
 
 The governing classifier rule is `reuse -> normalize -> extend only when
 necessary`. Reuse and creation can occur in the same tag proposal.
+
+Consolidation runs separately and only on request: the Vocabulary screen fetches
+the live library, pairs entries with the planner's lexical duplicate rules, adds
+one model audit for synonyms, and stores the suggestions. A merge bulk-edits the
+affected documents onto the kept entry under the same vocabulary lock the job
+workers use, then deletes the emptied entry. Dismissed pairs persist so they are
+not suggested again.
 
 ## Failure boundaries
 
@@ -180,8 +197,8 @@ necessary`. Reuse and creation can occur in the same tag proposal.
 
 ## UI information architecture
 
-The build-free web client has five focused views: overview, jobs, intervention,
-decisions, and settings. The intervention queue unifies OCR conflicts and
+The build-free web client has six focused views: overview, jobs, intervention,
+decisions, vocabulary, and settings. The intervention queue unifies OCR conflicts and
 exhausted jobs while retaining distinct actions. Conflict detail is loaded only
 on demand and presents both texts, scores, and mismatch excerpts. Decision
 detail includes an on-demand diagnostic log containing the bounded model and

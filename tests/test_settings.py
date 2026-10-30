@@ -206,3 +206,17 @@ def test_ntfy_settings_require_a_valid_topic_and_keep_token_private() -> None:
     assert "ntfy_token" not in settings.public_dict()
     assert settings.public_dict()["ntfy_token_configured"] is True
     assert "secret-token" not in str(settings.public_dict())
+
+
+def test_hidden_tags_are_normalized_and_include_the_queue_tag() -> None:
+    settings = Settings(
+        metadata_hidden_tags=" ocr-conflict ,, paperless-gpt-failed, ocr-conflict",
+        automation_tag="!to-process",
+    )
+
+    assert settings.metadata_hidden_tags == "ocr-conflict, paperless-gpt-failed"
+    assert settings.hidden_tag_names == {"ocr-conflict", "paperless-gpt-failed", "!to-process"}
+    assert "Health" in Settings().metadata_tag_guidance
+    assert (
+        Settings(metadata_tag_guidance="  only   Finance  ").metadata_tag_guidance == "only Finance"
+    )

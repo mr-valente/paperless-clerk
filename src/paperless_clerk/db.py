@@ -422,6 +422,24 @@ class Database:
             self.add_event(job_id, "info", "cancelled", "Job cancelled")
         return bool(cursor.rowcount)
 
+    CLEARABLE_STATUSES = frozenset({"failed", "cancelled"})
+
+    def clear_jobs(self, statuses: Iterable[str]) -> int:
+        """Delete finished jobs in the given statuses along with their events and pages.
+
+        Only failed and cancelled jobs qualify: completed jobs own decisions and
+        needs-review jobs own conflicts, and both cascade on delete.
+        """
+        wanted = sorted(set(statuses) & self.CLEARABLE_STATUSES)
+        if not wanted:
+            return 0
+        placeholders = ",".join("?" for _ in wanted)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM jobs WHERE status IN ({placeholders})", wanted
+            )
+        return cursor.rowcount
+
     def get_job(self, job_id: str, *, include_events: bool = False) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
